@@ -458,18 +458,27 @@ class _GeneralState extends State<_General> {
       return const Offstage();
     }
 
-    return _Card(title: 'Service', children: [
-      Obx(() => _Button(serviceStop.value ? 'Start' : 'Stop', () {
-            () async {
-              serviceBtnEnabled.value = false;
-              await start_service(serviceStop.value);
-              // enable the button after 1 second
-              Future.delayed(const Duration(seconds: 1), () {
-                serviceBtnEnabled.value = true;
-              });
-            }();
-          }, enabled: serviceBtnEnabled.value))
-    ]);
+    final hideStopService =
+        bind.mainGetBuildinOption(key: kOptionHideStopService) == 'Y';
+
+    return Obx(() {
+      if (hideStopService && !serviceStop.value) {
+        return const Offstage();
+      }
+
+      return _Card(title: 'Service', children: [
+        _Button(serviceStop.value ? 'Start' : 'Stop', () {
+          () async {
+            serviceBtnEnabled.value = false;
+            await start_service(serviceStop.value);
+            // enable the button after 1 second
+            Future.delayed(const Duration(seconds: 1), () {
+              serviceBtnEnabled.value = true;
+            });
+          }();
+        }, enabled: serviceBtnEnabled.value)
+      ]);
+    });
   }
 
   Widget other() {
@@ -1100,8 +1109,9 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                             if (value ==
                                     passwordValues[passwordKeys
                                         .indexOf(kUsePermanentPassword)] &&
-                                (await bind.mainGetPermanentPassword())
-                                    .isEmpty) {
+                                (await bind.mainGetCommon(
+                                        key: "permanent-password-set")) !=
+                                    "true") {
                               if (isChangePermanentPasswordDisabled()) {
                                 await callback();
                                 return;
@@ -2026,27 +2036,64 @@ class _AccountState extends State<_Account> {
   }
 
   Widget useInfo() {
-    text(String key, String value) {
-      return Align(
-        alignment: Alignment.centerLeft,
-        child: SelectionArea(child: Text('${translate(key)}: $value'))
-            .marginSymmetric(vertical: 4),
-      );
-    }
-
     return Obx(() => Offstage(
           offstage: gFFI.userModel.userName.value.isEmpty,
-          child: Column(
-            children: [
-              if (gFFI.userModel.displayName.value.trim().isNotEmpty &&
-                  gFFI.userModel.displayName.value.trim() !=
-                      gFFI.userModel.userName.value.trim())
-                text('Display Name', gFFI.userModel.displayName.value.trim()),
-              text('Username', gFFI.userModel.userName.value),
-              // text('Group', gFFI.groupModel.groupName.value),
-            ],
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Builder(builder: (context) {
+              final avatarWidget = _buildUserAvatar();
+              return Row(
+                children: [
+                  if (avatarWidget != null) avatarWidget,
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          gFFI.userModel.displayNameOrUserName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        SelectionArea(
+                          child: Text(
+                            '@${gFFI.userModel.userName.value}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color:
+                                  Theme.of(context).textTheme.bodySmall?.color,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            }),
           ),
         )).marginOnly(left: 18, top: 16);
+  }
+
+  Widget? _buildUserAvatar() {
+    // Resolve relative avatar path at display time
+    final avatar =
+        bind.mainResolveAvatarUrl(avatar: gFFI.userModel.avatar.value);
+    return buildAvatarWidget(
+      avatar: avatar,
+      size: 44,
+    );
   }
 }
 

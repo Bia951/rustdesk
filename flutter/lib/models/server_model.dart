@@ -471,17 +471,6 @@ class ServerModel with ChangeNotifier {
     WakelockManager.disable(_wakelockKey);
   }
 
-  Future<bool> setPermanentPassword(String newPW) async {
-    await bind.mainSetPermanentPassword(password: newPW);
-    await Future.delayed(Duration(milliseconds: 500));
-    final pw = await bind.mainGetPermanentPassword();
-    if (newPW == pw) {
-      return true;
-    } else {
-      return false;
-    }
-  }
-
   fetchID() async {
     final id = await bind.mainGetMyId();
     if (id != _serverId.id) {
@@ -820,6 +809,7 @@ class Client {
   bool isTerminal = false;
   String portForward = "";
   String name = "";
+  String avatar = "";
   String peerId = ""; // peer user's id,show at app
   bool keyboard = false;
   bool clipboard = false;
@@ -847,6 +837,7 @@ class Client {
     isTerminal = json['is_terminal'] ?? false;
     portForward = json['port_forward'];
     name = json['name'];
+    avatar = json['avatar'] ?? '';
     peerId = json['peer_id'];
     keyboard = json['keyboard'];
     clipboard = json['clipboard'];
@@ -870,6 +861,7 @@ class Client {
     data['is_terminal'] = isTerminal;
     data['port_forward'] = portForward;
     data['name'] = name;
+    data['avatar'] = avatar;
     data['peer_id'] = peerId;
     data['keyboard'] = keyboard;
     data['clipboard'] = clipboard;
