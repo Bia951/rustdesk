@@ -402,8 +402,8 @@ class MyTheme {
     );
   }
 
-  static DialogThemeData _dialogTheme(ColorScheme colorScheme) {
-    return DialogThemeData(
+  static DialogTheme _dialogTheme(ColorScheme colorScheme) {
+    return DialogTheme(
       backgroundColor: colorScheme.surface,
       surfaceTintColor: Colors.transparent,
       elevation: 8,
@@ -448,9 +448,8 @@ class MyTheme {
     );
   }
 
-  static CardThemeData _cardTheme(ColorScheme colorScheme,
-      {double elevation = 0}) {
-    return CardThemeData(
+  static CardTheme _cardTheme(ColorScheme colorScheme, {double elevation = 0}) {
+    return CardTheme(
       elevation: elevation,
       color: colorScheme.surfaceContainerHighest,
       surfaceTintColor: Colors.transparent,
@@ -531,7 +530,6 @@ class MyTheme {
       scaffoldBackgroundColor: scaffoldColor,
       colorScheme: colorScheme,
       appBarTheme: _appBarTheme(colorScheme),
-      dialogTheme: _dialogTheme(colorScheme),
       scrollbarTheme: isLight ? scrollbarTheme : scrollbarThemeDark,
       inputDecorationTheme: (isDesktop || isWebDesktop)
           ? _inputDecorationTheme(
@@ -541,15 +539,8 @@ class MyTheme {
           : null,
       textTheme: textTheme,
       cardColor: cardColor,
-      cardTheme: _cardTheme(colorScheme),
       hintColor: const Color(0xFFAAAAAA),
       visualDensity: VisualDensity.adaptivePlatformDensity,
-      tabBarTheme: TabBarThemeData(
-        labelColor: colorScheme.onSurface,
-        unselectedLabelColor: colorScheme.onSurfaceVariant,
-        indicatorColor: colorScheme.primary,
-        dividerColor: colorScheme.outlineVariant,
-      ),
       tooltipTheme: tooltipTheme(),
       splashColor: (isDesktop || isWebDesktop) ? Colors.transparent : null,
       highlightColor: (isDesktop || isWebDesktop) ? Colors.transparent : null,
