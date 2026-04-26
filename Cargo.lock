@@ -7286,6 +7286,7 @@ dependencies = [
  "default-net",
  "dispatch",
  "docopt",
+ "drm",
  "enigo",
  "errno",
  "evdev",
