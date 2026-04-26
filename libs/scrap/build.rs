@@ -9,18 +9,68 @@ fn link_pkg_config(name: &str) -> Vec<PathBuf> {
     // sometimes an override is needed
     let pc_name = match name {
         "libvpx" => "vpx",
+        "libyuv" => "yuv",
         _ => name,
     };
-    let lib = pkg_config::probe_library(pc_name)
-        .expect(format!(
-            "unable to find '{pc_name}' development headers with pkg-config (feature linux-pkg-config is enabled).
-            try installing '{pc_name}-dev' from your system package manager.").as_str());
-
-    lib.include_paths
+    match pkg_config::probe_library(pc_name) {
+        Ok(lib) => lib.include_paths,
+        Err(err) => {
+            if name == "libyuv" {
+                if let Some(include_paths) = link_linux_fallback_libyuv() {
+                    println!(
+                        "cargo:warning=Falling back to manual linux libyuv detection because pkg-config lookup for '{pc_name}' failed: {err}"
+                    );
+                    return include_paths;
+                }
+            }
+            panic!(
+                "unable to find '{}' development headers with pkg-config (feature linux-pkg-config is enabled).\n            try installing '{}-dev' from your system package manager.: \n{}",
+                pc_name, pc_name, err
+            );
+        }
+    }
 }
 #[cfg(not(all(target_os = "linux", feature = "linux-pkg-config")))]
 fn link_pkg_config(_name: &str) -> Vec<PathBuf> {
     unimplemented!()
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-pkg-config"))]
+fn link_linux_fallback_libyuv() -> Option<Vec<PathBuf>> {
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").ok()?;
+    let multiarch = match target_arch.as_str() {
+        "x86_64" => "x86_64-linux-gnu",
+        "aarch64" => "aarch64-linux-gnu",
+        "arm" => "arm-linux-gnueabihf",
+        "loongarch64" => "loongarch64-linux-gnu",
+        _ => "",
+    };
+
+    let mut lib_dirs = Vec::new();
+    if !multiarch.is_empty() {
+        lib_dirs.push(PathBuf::from("/usr/lib").join(multiarch));
+    }
+    lib_dirs.push(PathBuf::from("/usr/lib64"));
+    lib_dirs.push(PathBuf::from("/usr/lib"));
+
+    let lib_dir = lib_dirs.into_iter().find(|dir| {
+        dir.join("libyuv.so").exists()
+            || dir.join("libyuv.a").exists()
+            || dir.join("libyuv.so.0").exists()
+    })?;
+
+    let include_candidates = [
+        PathBuf::from("/usr/include"),
+        PathBuf::from("/usr/include/libyuv"),
+    ];
+    let include_dir = include_candidates
+        .iter()
+        .find(|dir| dir.join("libyuv.h").exists() || dir.join("convert.h").exists())?
+        .clone();
+
+    println!("cargo:rustc-link-lib=yuv");
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    Some(vec![include_dir])
 }
 
 /// Link vcpkg package.

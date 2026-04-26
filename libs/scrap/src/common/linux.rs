@@ -2,15 +2,16 @@ use crate::{
     common::{
         wayland,
         x11::{self},
-        TraitCapturer,
+        LinuxCaptureBackend, TraitCapturer,
     },
-    Frame,
+    kms, Frame,
 };
 use std::{io, time::Duration};
 
 pub enum Capturer {
     X11(x11::Capturer),
     WAYLAND(wayland::Capturer),
+    KMS(kms::Capturer),
 }
 
 impl Capturer {
@@ -18,6 +19,7 @@ impl Capturer {
         Ok(match display {
             Display::X11(d) => Capturer::X11(x11::Capturer::new(d)?),
             Display::WAYLAND(d) => Capturer::WAYLAND(wayland::Capturer::new(d)?),
+            Display::KMS(d) => Capturer::KMS(kms::Capturer::new(d)?),
         })
     }
 
@@ -25,6 +27,7 @@ impl Capturer {
         match self {
             Capturer::X11(d) => d.width(),
             Capturer::WAYLAND(d) => d.width(),
+            Capturer::KMS(d) => d.width(),
         }
     }
 
@@ -32,6 +35,7 @@ impl Capturer {
         match self {
             Capturer::X11(d) => d.height(),
             Capturer::WAYLAND(d) => d.height(),
+            Capturer::KMS(d) => d.height(),
         }
     }
 }
@@ -41,6 +45,7 @@ impl TraitCapturer for Capturer {
         match self {
             Capturer::X11(d) => d.frame(timeout),
             Capturer::WAYLAND(d) => d.frame(timeout),
+            Capturer::KMS(d) => d.frame(timeout),
         }
     }
 }
@@ -48,29 +53,35 @@ impl TraitCapturer for Capturer {
 pub enum Display {
     X11(x11::Display),
     WAYLAND(wayland::Display),
+    KMS(kms::Display),
 }
 
 impl Display {
     pub fn primary() -> io::Result<Display> {
-        Ok(if super::is_x11() {
-            Display::X11(x11::Display::primary()?)
-        } else {
-            Display::WAYLAND(wayland::Display::primary()?)
+        Ok(match super::linux_capture_backend() {
+            LinuxCaptureBackend::X11 => Display::X11(x11::Display::primary()?),
+            LinuxCaptureBackend::Wayland => Display::WAYLAND(wayland::Display::primary()?),
+            LinuxCaptureBackend::Kms => Display::KMS(kms::Display::primary()?),
+            LinuxCaptureBackend::Auto => unreachable!(),
         })
     }
 
     // Currently, wayland need to call wayland::clear() before call Display::all()
     pub fn all() -> io::Result<Vec<Display>> {
-        Ok(if super::is_x11() {
-            x11::Display::all()?
+        Ok(match super::linux_capture_backend() {
+            LinuxCaptureBackend::X11 => x11::Display::all()?
                 .drain(..)
                 .map(|x| Display::X11(x))
-                .collect()
-        } else {
-            wayland::Display::all()?
+                .collect(),
+            LinuxCaptureBackend::Wayland => wayland::Display::all()?
                 .drain(..)
                 .map(|x| Display::WAYLAND(x))
-                .collect()
+                .collect(),
+            LinuxCaptureBackend::Kms => kms::Display::all()?
+                .drain(..)
+                .map(|x| Display::KMS(x))
+                .collect(),
+            LinuxCaptureBackend::Auto => unreachable!(),
         })
     }
 
@@ -78,6 +89,7 @@ impl Display {
         match self {
             Display::X11(d) => d.width(),
             Display::WAYLAND(d) => d.width(),
+            Display::KMS(d) => d.width(),
         }
     }
 
@@ -85,6 +97,7 @@ impl Display {
         match self {
             Display::X11(d) => d.height(),
             Display::WAYLAND(d) => d.height(),
+            Display::KMS(d) => d.height(),
         }
     }
 
@@ -92,6 +105,7 @@ impl Display {
         match self {
             Display::X11(_d) => 1.0,
             Display::WAYLAND(d) => d.scale(),
+            Display::KMS(_d) => 1.0,
         }
     }
 
@@ -99,6 +113,7 @@ impl Display {
         match self {
             Display::X11(d) => d.width(),
             Display::WAYLAND(d) => d.logical_width(),
+            Display::KMS(d) => d.width(),
         }
     }
 
@@ -106,6 +121,7 @@ impl Display {
         match self {
             Display::X11(d) => d.height(),
             Display::WAYLAND(d) => d.logical_height(),
+            Display::KMS(d) => d.height(),
         }
     }
 
@@ -113,6 +129,7 @@ impl Display {
         match self {
             Display::X11(d) => d.origin(),
             Display::WAYLAND(d) => d.origin(),
+            Display::KMS(d) => d.origin(),
         }
     }
 
@@ -120,6 +137,7 @@ impl Display {
         match self {
             Display::X11(d) => d.is_online(),
             Display::WAYLAND(d) => d.is_online(),
+            Display::KMS(d) => d.is_online(),
         }
     }
 
@@ -127,6 +145,7 @@ impl Display {
         match self {
             Display::X11(d) => d.is_primary(),
             Display::WAYLAND(d) => d.is_primary(),
+            Display::KMS(d) => d.is_primary(),
         }
     }
 
@@ -134,6 +153,7 @@ impl Display {
         match self {
             Display::X11(d) => d.name(),
             Display::WAYLAND(d) => d.name(),
+            Display::KMS(d) => d.name(),
         }
     }
 }

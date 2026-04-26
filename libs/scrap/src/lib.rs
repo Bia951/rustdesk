@@ -17,6 +17,9 @@ pub mod x11;
 #[cfg(all(x11, feature = "wayland"))]
 pub mod wayland;
 
+#[cfg(x11)]
+pub mod kms;
+
 #[cfg(dxgi)]
 pub mod dxgi;
 

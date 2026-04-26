@@ -1,7 +1,5 @@
 use super::*;
 use crate::common::SimpleCallOnReturn;
-#[cfg(target_os = "linux")]
-use crate::platform::linux::is_x11;
 #[cfg(windows)]
 use crate::virtual_display_manager;
 #[cfg(windows)]
@@ -96,7 +94,7 @@ pub(super) fn check_display_changed(
     #[cfg(target_os = "linux")]
     {
         // wayland do not support changing display for now
-        if !is_x11() {
+        if scrap::is_linux_wayland_capture_backend() {
             return None;
         }
     }
@@ -200,7 +198,7 @@ fn displays_to_msg(displays: Vec<DisplayInfo>) -> Message {
 fn check_get_displays_changed_msg() -> Option<Message> {
     #[cfg(target_os = "linux")]
     {
-        if !is_x11() {
+        if scrap::is_linux_wayland_capture_backend() {
             return get_displays_msg();
         }
     }
@@ -213,7 +211,7 @@ pub fn check_displays_changed() -> ResultType<()> {
     {
         // Currently, wayland need to call wayland::clear() before call Display::all(), otherwise it will cause
         // block, or even crash here, https://github.com/rustdesk/rustdesk/blob/0bb4d43e9ea9d9dfb9c46c8d27d1a97cd0ad6bea/libs/scrap/src/wayland/pipewire.rs#L235
-        if !is_x11() {
+        if scrap::is_linux_wayland_capture_backend() {
             return Ok(());
         }
     }
@@ -307,7 +305,7 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
     // For compatibility: if only one display, scale remains 1.0 and we use the physical size for `uinput`.
     // If there are multiple displays, we use the logical size for `uinput` by setting scale to d.scale().
     #[cfg(target_os = "linux")]
-    let use_logical_scale = !is_x11()
+    let use_logical_scale = scrap::is_linux_wayland_capture_backend()
         && crate::is_server()
         && scrap::wayland::display::get_displays().displays.len() > 1;
     let displays = all
@@ -351,7 +349,7 @@ pub(super) fn check_update_displays(all: &Vec<Display>) {
 
 pub fn is_inited_msg() -> Option<Message> {
     #[cfg(target_os = "linux")]
-    if !is_x11() {
+    if scrap::is_linux_wayland_capture_backend() {
         return super::wayland::is_inited();
     }
     None
@@ -360,7 +358,7 @@ pub fn is_inited_msg() -> Option<Message> {
 pub async fn update_get_sync_displays_on_login() -> ResultType<Vec<DisplayInfo>> {
     #[cfg(target_os = "linux")]
     {
-        if !is_x11() {
+        if scrap::is_linux_wayland_capture_backend() {
             return super::wayland::get_displays().await;
         }
     }
@@ -376,7 +374,7 @@ pub async fn update_get_sync_displays_on_login() -> ResultType<Vec<DisplayInfo>>
 pub fn get_primary() -> usize {
     #[cfg(target_os = "linux")]
     {
-        if !is_x11() {
+        if scrap::is_linux_wayland_capture_backend() {
             return match super::wayland::get_primary() {
                 Ok(n) => n,
                 Err(_) => 0,

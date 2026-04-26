@@ -580,6 +580,26 @@ class _GeneralState extends State<_General> {
       children.add(_OptionCheckBox(
           context, 'Allow linux headless', kOptionAllowLinuxHeadless));
     }
+    if (isLinux && !bind.isOutgoingOnly()) {
+      children.add(
+        Tooltip(
+          message: translate('kmsgrab_capture_tip'),
+          child: _OptionCheckBox(
+            context,
+            'Use kmsgrab as graphics capture backend',
+            kOptionLinuxCaptureBackend,
+            optGetter: () =>
+                bind
+                    .mainGetOptionSync(key: kOptionLinuxCaptureBackend)
+                    .toLowerCase() ==
+                'kms',
+            optSetter: (key, value) async {
+              await bind.mainSetOption(key: key, value: value ? 'kms' : '');
+            },
+          ),
+        ),
+      );
+    }
     if (!bind.isDisableAccount()) {
       children.add(_OptionCheckBox(
         context,

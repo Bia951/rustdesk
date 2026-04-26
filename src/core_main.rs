@@ -516,6 +516,20 @@ pub fn core_main() -> Option<Vec<String>> {
                 println!("Installation and administrative privileges required!");
             }
             return None;
+        } else if args[0] == "--test-display-frame" {
+            let display_idx = args
+                .get(1)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let timeout_millis = args
+                .get(2)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3000);
+            println!(
+                "{}",
+                crate::video_service::test_capture_frame(display_idx, timeout_millis)
+            );
+            return None;
         } else if args[0] == "--assign" {
             if config::Config::no_register_device() {
                 println!("Cannot assign an unregistrable device!");
@@ -624,6 +638,16 @@ pub fn core_main() -> Option<Vec<String>> {
         } else if args[0] == "--check-hwcodec-config" {
             #[cfg(feature = "hwcodec")]
             crate::ipc::hwcodec_process();
+            return None;
+        } else if args[0] == "--kms-helper" {
+            #[cfg(target_os = "linux")]
+            {
+                let helper_args: Vec<String> = args[1..].to_vec();
+                if let Err(e) = crate::kms_helper::run(&helper_args) {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
             return None;
         } else if args[0] == "--terminal-helper" {
             // Terminal helper process - runs as user to create ConPTY

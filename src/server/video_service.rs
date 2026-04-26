@@ -21,8 +21,6 @@
 use super::{display_service::check_display_changed, service::ServiceTmpl, video_qos::VideoQoS, *};
 #[cfg(target_os = "linux")]
 use crate::common::SimpleCallOnReturn;
-#[cfg(target_os = "linux")]
-use crate::platform::linux::is_x11;
 use crate::privacy_mode::{get_privacy_mode_conn_id, INVALID_PRIVACY_MODE_CONN_ID};
 #[cfg(windows)]
 use crate::{
@@ -49,7 +47,7 @@ use scrap::{
     codec::{Encoder, EncoderCfg},
     record::{Recorder, RecorderContext},
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
-    CodecFormat, Display, EncodeInput, TraitCapturer, TraitPixelBuffer,
+    CodecFormat, Display, EncodeInput, Frame, TraitCapturer, TraitPixelBuffer,
 };
 #[cfg(windows)]
 use std::sync::Once;
@@ -339,6 +337,46 @@ pub fn test_create_capturer(
     }
 }
 
+pub fn test_capture_frame(display_idx: usize, timeout_millis: u64) -> String {
+    let test_begin = Instant::now();
+    loop {
+        let result: ResultType<String> = (|| {
+            let mut displays = Display::all()?;
+            if displays.len() <= display_idx {
+                bail!(
+                    "Failed to get display {}, the displays' count is {}",
+                    display_idx,
+                    displays.len()
+                );
+            }
+            let display = displays.remove(display_idx);
+            let mut capturer = create_capturer(0, display, display_idx, false)?;
+            match capturer.frame(Duration::from_millis(0)) {
+                Ok(Frame::PixelBuffer(frame)) => Ok(format!(
+                    "ok width={} height={} stride={} pixfmt={:?} bytes={}",
+                    frame.width(),
+                    frame.height(),
+                    frame.stride().get(0).copied().unwrap_or_default(),
+                    frame.pixfmt(),
+                    frame.data().len()
+                )),
+                Ok(Frame::Texture(_)) => Ok("ok texture-frame".to_owned()),
+                Err(err) => Err(err.into()),
+            }
+        })();
+
+        match result {
+            Ok(msg) => return msg,
+            Err(err) => {
+                if test_begin.elapsed().as_millis() >= timeout_millis as _ {
+                    return err.to_string();
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // Note: This function is extremely expensive, do not call it frequently.
 #[cfg(windows)]
 fn check_uac_switch(privacy_mode_id: i32, capturer_privacy_mode_id: i32) -> ResultType<()> {
@@ -390,7 +428,7 @@ fn get_capturer_monitor(
 ) -> ResultType<CapturerInfo> {
     #[cfg(target_os = "linux")]
     {
-        if !is_x11() {
+        if scrap::is_linux_wayland_capture_backend() {
             return super::wayland::get_capturer_for_display(current);
         }
     }
@@ -537,14 +575,20 @@ fn run(vs: VideoService) -> ResultType<()> {
     // to-do: wayland ensure_inited should pass current display index.
     // But for now, we do not support multi-screen capture on wayland.
     #[cfg(target_os = "linux")]
-    super::wayland::ensure_inited()?;
+    if scrap::is_linux_wayland_capture_backend() {
+        super::wayland::ensure_inited()?;
+    }
     #[cfg(target_os = "linux")]
     let _wayland_call_on_ret = {
-        // Increment active display count when starting
-        let _display_count = super::wayland::increment_active_display_count();
+        let use_wayland = scrap::is_linux_wayland_capture_backend();
+        let _display_count = if use_wayland {
+            Some(super::wayland::increment_active_display_count())
+        } else {
+            None
+        };
 
         SimpleCallOnReturn {
-            b: true,
+            b: use_wayland,
             f: Box::new(|| {
                 // Decrement active display count and only clear if this was the last display
                 let remaining_count = super::wayland::decrement_active_display_count();
@@ -807,7 +851,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                 #[cfg(target_os = "linux")]
                 {
                     would_block_count += 1;
-                    if !is_x11() {
+                    if scrap::is_linux_wayland_capture_backend() {
                         if would_block_count >= 100 {
                             // to-do: Unknown reason for WouldBlock 100 times (seconds = 100 * 1 / fps)
                             // https://github.com/rustdesk/rustdesk/blob/63e6b2f8ab51743e77a151e2b7ff18816f5fa2fb/libs/scrap/src/common/wayland.rs#L81

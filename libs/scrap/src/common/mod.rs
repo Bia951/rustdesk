@@ -1,6 +1,8 @@
 pub use self::vpxcodec::*;
 use hbb_common::{
-    bail, log,
+    bail,
+    config::{keys, Config},
+    log,
     message_proto::{video_frame, Chroma, VideoFrame},
     ResultType,
 };
@@ -266,13 +268,52 @@ pub fn is_x11() -> bool {
 }
 
 #[cfg(x11)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxCaptureBackend {
+    Auto,
+    X11,
+    Wayland,
+    Kms,
+}
+
+#[cfg(x11)]
+pub fn configured_linux_capture_backend() -> LinuxCaptureBackend {
+    let configured = std::env::var("RUSTDESK_LINUX_CAPTURE_BACKEND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| Config::get_option(keys::OPTION_LINUX_CAPTURE_BACKEND));
+    match configured.trim().to_ascii_lowercase().as_str() {
+        "x11" => LinuxCaptureBackend::X11,
+        "wayland" => LinuxCaptureBackend::Wayland,
+        "kms" => LinuxCaptureBackend::Kms,
+        _ => LinuxCaptureBackend::Auto,
+    }
+}
+
+#[cfg(x11)]
+pub fn linux_capture_backend() -> LinuxCaptureBackend {
+    match configured_linux_capture_backend() {
+        LinuxCaptureBackend::Auto => {
+            if is_x11() {
+                LinuxCaptureBackend::X11
+            } else {
+                LinuxCaptureBackend::Wayland
+            }
+        }
+        backend => backend,
+    }
+}
+
+#[cfg(x11)]
+#[inline]
+pub fn is_linux_wayland_capture_backend() -> bool {
+    linux_capture_backend() == LinuxCaptureBackend::Wayland
+}
+
+#[cfg(x11)]
 #[inline]
 pub fn is_cursor_embedded() -> bool {
-    if is_x11() {
-        x11::IS_CURSOR_EMBEDDED
-    } else {
-        false
-    }
+    linux_capture_backend() == LinuxCaptureBackend::X11 && x11::IS_CURSOR_EMBEDDED
 }
 
 #[cfg(not(x11))]

@@ -398,6 +398,8 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Hide connection management window", "隐藏连接管理窗口"),
         ("hide_cm_tip", "在只允许密码连接并且只用固定密码的情况下才允许隐藏"),
         ("wayland_experiment_tip", "Wayland 支持处于实验阶段，如果你需要使用无人值守访问，请使用 X11。"),
+        ("kmsgrab_capture_tip", "实验性的 Linux 图形捕获后端。启用后将使用 kmsgrab。修改此选项后需要重启软件。"),
+        ("Use kmsgrab as graphics capture backend", "使用 kmsgrab 作为图形捕获后端"),
         ("Right click to select tabs", "右键选择选项卡"),
         ("Skipped", "已跳过"),
         ("Add to address book", "添加到地址簿"),
