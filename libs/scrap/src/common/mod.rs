@@ -1,7 +1,7 @@
 pub use self::vpxcodec::*;
 use hbb_common::{
     bail,
-    config::{keys, Config},
+    config::Config,
     log,
     message_proto::{video_frame, Chroma, VideoFrame},
     ResultType,
@@ -278,10 +278,11 @@ pub enum LinuxCaptureBackend {
 
 #[cfg(x11)]
 pub fn configured_linux_capture_backend() -> LinuxCaptureBackend {
+    const OPTION_LINUX_CAPTURE_BACKEND: &str = "linux-capture-backend";
     let configured = std::env::var("RUSTDESK_LINUX_CAPTURE_BACKEND")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| Config::get_option(keys::OPTION_LINUX_CAPTURE_BACKEND));
+        .unwrap_or_else(|| Config::get_option(OPTION_LINUX_CAPTURE_BACKEND));
     match configured.trim().to_ascii_lowercase().as_str() {
         "x11" => LinuxCaptureBackend::X11,
         "wayland" => LinuxCaptureBackend::Wayland,
