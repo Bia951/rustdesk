@@ -48,6 +48,14 @@ impl TraitCapturer for Capturer {
             Capturer::KMS(d) => d.frame(timeout),
         }
     }
+
+    fn capturer_width(&self) -> Option<usize> {
+        Some(self.width())
+    }
+
+    fn capturer_height(&self) -> Option<usize> {
+        Some(self.height())
+    }
 }
 
 pub enum Display {

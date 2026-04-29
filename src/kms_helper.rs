@@ -9,13 +9,19 @@ use hbb_common::{
 };
 use serde::Serialize;
 use std::{
+    cmp::Reverse,
     fs,
     fs::OpenOptions,
-    io::{self, ErrorKind, Write},
+    io::{self, BufRead, BufReader, ErrorKind, Write},
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     path::{Path, PathBuf},
     process::Command,
 };
+
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
+const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+const DRM_IOCTL_MODE_MAP_DUMB: libc::c_ulong = 0xc010_64b3;
 
 #[derive(Serialize)]
 struct ProbeOutput {
@@ -72,6 +78,14 @@ pub fn run(args: &[String]) -> ResultType<()> {
         Some("frame-privileged") => {
             let display_name = args.get(1).context("missing kms helper display name")?;
             write_frame(&frame(display_name, true)?)
+        }
+        Some("stream") => {
+            let display_name = args.get(1).context("missing kms helper display name")?;
+            stream(display_name, false)
+        }
+        Some("stream-privileged") => {
+            let display_name = args.get(1).context("missing kms helper display name")?;
+            stream(display_name, true)
         }
         Some(cmd) => bail!("unsupported kms helper command: {cmd}"),
         None => bail!("missing kms helper command"),
@@ -137,6 +151,46 @@ fn frame(display_name: &str, privileged: bool) -> ResultType<FrameCapture> {
     }
 }
 
+fn stream(display_name: &str, privileged: bool) -> ResultType<()> {
+    let display = find_display(display_name)?;
+    if !privileged && !display.can_open {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            display
+                .open_error
+                .clone()
+                .unwrap_or_else(|| "failed to open drm device".to_owned()),
+        )
+        .into());
+    }
+
+    let card = Card(open_card(Path::new(&display.card_path))?);
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(b"ready\n")?;
+    stdout.flush()?;
+    drop(stdout);
+
+    let stdin = io::stdin();
+    let mut stdin = BufReader::new(stdin.lock());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = stdin.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        match line.trim() {
+            "frame" => write_frame(&capture_frame(&card, &display, privileged)?)?,
+            "quit" => break,
+            "" => {}
+            cmd => bail!("unsupported kms helper stream command: {cmd}"),
+        }
+    }
+    Ok(())
+}
+
 fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return Ok(None);
@@ -151,7 +205,7 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
     }
 
     let mode = read_first_line(path.join("modes"))?;
-    let Some((width, height)) = parse_mode(&mode) else {
+    let Some((mut width, mut height)) = parse_mode(&mode) else {
         return Ok(None);
     };
 
@@ -161,6 +215,18 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
         .context("invalid drm connector name")?;
     let card_path = PathBuf::from("/dev/dri").join(card_name);
     let (can_open, open_error) = check_card_access(&card_path);
+    if can_open {
+        if let Ok(card) = open_card(&card_path) {
+            let card = Card(card);
+            configure_card(&card, false);
+            if let Ok((active_width, active_height)) =
+                active_framebuffer_size(&card, name, width, height)
+            {
+                width = active_width;
+                height = active_height;
+            }
+        }
+    }
 
     Ok(Some(ProbeDisplay {
         card_path: card_path.display().to_string(),
@@ -187,6 +253,42 @@ fn find_display(display_name: &str) -> ResultType<ProbeDisplay> {
         }
     }
     bail!("kms display '{display_name}' not found");
+}
+
+fn active_framebuffer_size(
+    card: &Card,
+    display_name: &str,
+    fallback_width: usize,
+    fallback_height: usize,
+) -> ResultType<(usize, usize)> {
+    let connector_name = display_name
+        .split_once('-')
+        .map(|(_, name)| name)
+        .context("invalid display name")?;
+    let resources = card.resource_handles()?;
+    let connector = resolve_connector(card, connector_name, resources.connectors())?;
+    let encoder_handle = connector
+        .current_encoder()
+        .or_else(|| connector.encoders().first().copied())
+        .context("connector has no active encoder")?;
+    let encoder = card.get_encoder(encoder_handle)?;
+    let crtc_handle = encoder
+        .crtc()
+        .or_else(|| {
+            resources
+                .filter_crtcs(encoder.possible_crtcs())
+                .into_iter()
+                .next()
+        })
+        .context("encoder has no active CRTC")?;
+    let crtc = card.get_crtc(crtc_handle)?;
+    let framebuffer = resolve_framebuffers(card, crtc_handle, &crtc, fallback_width, fallback_height)?
+        .into_iter()
+        .next()
+        .context("crtc has no active framebuffer")?;
+    let info = card.get_framebuffer(framebuffer)?;
+    let size = info.size();
+    Ok((size.0 as usize, size.1 as usize))
 }
 
 fn open_card(card_path: &Path) -> io::Result<std::fs::File> {
@@ -221,7 +323,39 @@ fn capture_frame(
         })
         .context("encoder has no active CRTC")?;
     let crtc = card.get_crtc(crtc_handle)?;
-    let framebuffer = resolve_framebuffer(card, crtc_handle, &crtc, display)?;
+    let framebuffers =
+        resolve_framebuffers(card, crtc_handle, &crtc, display.width, display.height)?;
+    let mut fallback = None;
+    let mut last_err = None;
+    for framebuffer in framebuffers {
+        match capture_framebuffer(card, display, framebuffer) {
+            Ok(frame) => {
+                if frame_has_visible_rgb(&frame) {
+                    return Ok(frame);
+                }
+                if fallback.is_none() {
+                    fallback = Some(frame);
+                }
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+    if let Some(frame) = fallback {
+        return Ok(frame);
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    bail!("crtc has no active framebuffer")
+}
+
+fn capture_framebuffer(
+    card: &Card,
+    display: &ProbeDisplay,
+    framebuffer: control::framebuffer::Handle,
+) -> ResultType<FrameCapture> {
     let legacy = card.get_framebuffer(framebuffer)?;
     let planar = match card.get_planar_framebuffer(framebuffer) {
         Ok(planar) => planar,
@@ -247,7 +381,8 @@ fn capture_frame(
         .into());
     }
 
-    let pixfmt = map_drm_fourcc(planar.pixel_format())?;
+    let drm_format = planar.pixel_format();
+    let pixfmt = map_drm_fourcc(drm_format)?;
     let width = planar.size().0 as usize;
     let height = planar.size().1 as usize;
     let stride = planar.pitches()[0] as usize;
@@ -258,16 +393,22 @@ fn capture_frame(
     let map_len = offset
         .checked_add(body_len)
         .context("framebuffer map size overflow")?;
-    let prime_fd = card.buffer_to_prime_fd(buffer_handle, 0)?;
-    let mapping = MappedReadOnly::new(prime_fd.as_raw_fd(), map_len)?;
-    let end = offset
-        .checked_add(body_len)
-        .context("framebuffer slice overflow")?;
-    let bytes = mapping
-        .as_slice()
-        .get(offset..end)
-        .context("framebuffer mapping smaller than expected")?
-        .to_vec();
+    let mut bytes = read_prime_framebuffer(card, buffer_handle, offset, map_len, body_len)?;
+    if should_force_opaque_alpha(drm_format) {
+        force_opaque_alpha(&mut bytes);
+    }
+    if !bytes_have_visible_rgb(pixfmt, &bytes) {
+        if let Ok(mut dumb_bytes) =
+            read_dumb_framebuffer(card, buffer_handle, offset, map_len, body_len)
+        {
+            if should_force_opaque_alpha(drm_format) {
+                force_opaque_alpha(&mut dumb_bytes);
+            }
+            if bytes_have_visible_rgb(pixfmt, &dumb_bytes) {
+                bytes = dumb_bytes;
+            }
+        }
+    }
 
     Ok(FrameCapture {
         header: FrameOutput {
@@ -301,6 +442,7 @@ fn should_retry_privileged(err: &hbb_common::anyhow::Error) -> bool {
 
 fn retry_privileged_frame(display_name: &str) -> ResultType<FrameCapture> {
     let output = Command::new("pkexec")
+        .arg("--disable-internal-agent")
         .arg(std::env::current_exe()?)
         .arg("--kms-helper")
         .arg("frame-privileged")
@@ -358,17 +500,54 @@ fn leak_pixfmt(pixfmt: String) -> &'static str {
     }
 }
 
-fn resolve_framebuffer(
+fn read_prime_framebuffer(
+    card: &Card,
+    buffer_handle: drm::buffer::Handle,
+    offset: usize,
+    map_len: usize,
+    body_len: usize,
+) -> ResultType<Vec<u8>> {
+    let prime_fd = card.buffer_to_prime_fd(buffer_handle, 0)?;
+    let _sync = DmaBufReadSync::start(prime_fd.as_raw_fd());
+    let mapping = MappedReadOnly::new_at(prime_fd.as_raw_fd(), map_len, 0)?;
+    framebuffer_slice(&mapping, offset, body_len)
+}
+
+fn read_dumb_framebuffer(
+    card: &Card,
+    buffer_handle: drm::buffer::Handle,
+    offset: usize,
+    map_len: usize,
+    body_len: usize,
+) -> ResultType<Vec<u8>> {
+    let info = map_dumb_buffer(card.as_fd().as_raw_fd(), buffer_handle.into())?;
+    let mapping = MappedReadOnly::new_at(card.as_fd().as_raw_fd(), map_len, info.offset)?;
+    framebuffer_slice(&mapping, offset, body_len)
+}
+
+fn framebuffer_slice(
+    mapping: &MappedReadOnly,
+    offset: usize,
+    body_len: usize,
+) -> ResultType<Vec<u8>> {
+    let end = offset
+        .checked_add(body_len)
+        .context("framebuffer slice overflow")?;
+    Ok(mapping
+        .as_slice()
+        .get(offset..end)
+        .context("framebuffer mapping smaller than expected")?
+        .to_vec())
+}
+
+fn resolve_framebuffers(
     card: &Card,
     crtc_handle: control::crtc::Handle,
     crtc: &control::crtc::Info,
-    display: &ProbeDisplay,
-) -> ResultType<control::framebuffer::Handle> {
-    if let Some(framebuffer) = crtc.framebuffer() {
-        return Ok(framebuffer);
-    }
-
-    let mut best: Option<(usize, control::framebuffer::Handle)> = None;
+    min_width: usize,
+    min_height: usize,
+) -> ResultType<Vec<control::framebuffer::Handle>> {
+    let mut candidates = Vec::new();
     for plane_handle in card.plane_handles()? {
         let plane = match card.get_plane(plane_handle) {
             Ok(plane) => plane,
@@ -386,23 +565,47 @@ fn resolve_framebuffer(
         };
         let size = info.size();
         let area = size.0 as usize * size.1 as usize;
-
-        // Prefer framebuffers that are at least as large as the connector mode.
-        if size.0 as usize >= display.width && size.1 as usize >= display.height {
-            return Ok(framebuffer);
-        }
-
-        match best {
-            Some((best_area, _)) if best_area >= area => {}
-            _ => best = Some((area, framebuffer)),
-        }
+        let covers_mode = size.0 as usize >= min_width && size.1 as usize >= min_height;
+        candidates.push((!covers_mode, Reverse(area), framebuffer));
     }
 
-    if let Some((_, framebuffer)) = best {
-        return Ok(framebuffer);
+    candidates.sort_by_key(|candidate| (candidate.0, candidate.1));
+    let mut framebuffers = Vec::new();
+    for (_, _, framebuffer) in candidates {
+        push_unique_framebuffer(&mut framebuffers, framebuffer);
     }
 
-    bail!("crtc has no active framebuffer")
+    if let Some(framebuffer) = crtc.framebuffer() {
+        push_unique_framebuffer(&mut framebuffers, framebuffer);
+    }
+
+    if framebuffers.is_empty() {
+        bail!("crtc has no active framebuffer");
+    }
+    Ok(framebuffers)
+}
+
+fn push_unique_framebuffer(
+    framebuffers: &mut Vec<control::framebuffer::Handle>,
+    framebuffer: control::framebuffer::Handle,
+) {
+    if !framebuffers.iter().any(|existing| *existing == framebuffer) {
+        framebuffers.push(framebuffer);
+    }
+}
+
+fn frame_has_visible_rgb(frame: &FrameCapture) -> bool {
+    bytes_have_visible_rgb(frame.header.pixfmt, &frame.bytes)
+}
+
+fn bytes_have_visible_rgb(pixfmt: &str, bytes: &[u8]) -> bool {
+    match pixfmt {
+        "BGRA" | "RGBA" => bytes
+            .chunks_exact(4)
+            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+        "RGB565LE" => bytes.chunks_exact(2).any(|pixel| pixel[0] != 0 || pixel[1] != 0),
+        _ => bytes.iter().any(|byte| *byte != 0),
+    }
 }
 
 fn resolve_connector(
@@ -451,6 +654,16 @@ fn map_drm_fourcc(format: DrmFourcc) -> ResultType<&'static str> {
     }
 }
 
+fn should_force_opaque_alpha(format: DrmFourcc) -> bool {
+    matches!(format, DrmFourcc::Xrgb8888 | DrmFourcc::Xbgr8888)
+}
+
+fn force_opaque_alpha(bytes: &mut [u8]) {
+    for pixel in bytes.chunks_exact_mut(4) {
+        pixel[3] = 0xff;
+    }
+}
+
 fn check_card_access(card_path: &Path) -> (bool, Option<String>) {
     match open_card(card_path) {
         Ok(_) => (true, None),
@@ -481,8 +694,64 @@ struct MappedReadOnly {
     len: usize,
 }
 
+struct DmaBufReadSync {
+    fd: i32,
+}
+
+impl DmaBufReadSync {
+    fn start(fd: i32) -> Option<Self> {
+        if sync_dmabuf(fd, DMA_BUF_SYNC_READ).is_ok() {
+            Some(Self { fd })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for DmaBufReadSync {
+    fn drop(&mut self) {
+        let _ = sync_dmabuf(self.fd, DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END);
+    }
+}
+
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
+fn sync_dmabuf(fd: i32, flags: u64) -> io::Result<()> {
+    let mut sync = DmaBufSync { flags };
+    let ret = unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut sync) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[repr(C)]
+struct DrmModeMapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+
+fn map_dumb_buffer(fd: i32, handle: u32) -> io::Result<DrmModeMapDumb> {
+    let mut map = DrmModeMapDumb {
+        handle,
+        pad: 0,
+        offset: 0,
+    };
+    let ret = unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut map) };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(map)
+    }
+}
+
 impl MappedReadOnly {
-    fn new(fd: i32, len: usize) -> io::Result<Self> {
+    fn new_at(fd: i32, len: usize, offset: u64) -> io::Result<Self> {
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -490,7 +759,7 @@ impl MappedReadOnly {
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 fd,
-                0,
+                offset as libc::off_t,
             )
         };
         if ptr == libc::MAP_FAILED {
