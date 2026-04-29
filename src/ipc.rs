@@ -429,6 +429,8 @@ pub async fn start(postfix: &str) -> ResultType<()> {
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
     #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
+    ensure_ipc_parent_dir(&path, postfix)?;
+    #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
     check_pid(postfix).await;
     let mut endpoint = Endpoint::new(path.clone());
     match SecurityAttributes::allow_everyone_create() {
@@ -456,6 +458,26 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
             Err(err.into())
         }
     }
+}
+
+#[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
+fn ensure_ipc_parent_dir(path: &str, postfix: &str) -> std::io::Result<()> {
+    let Some(parent) = std::path::Path::new(path).parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if config::is_service_ipc_postfix(postfix) {
+            0o0711
+        } else {
+            0o0700
+        };
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 pub struct CheckIfRestart {

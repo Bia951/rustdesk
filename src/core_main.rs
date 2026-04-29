@@ -530,6 +530,24 @@ pub fn core_main() -> Option<Vec<String>> {
                 crate::video_service::test_capture_frame(display_idx, timeout_millis)
             );
             return None;
+        } else if args[0] == "--dump-display-frame" {
+            let display_idx = args
+                .get(1)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let path = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("/tmp/rustdesk-display-frame.png");
+            let timeout_millis = args
+                .get(3)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3000);
+            println!(
+                "{}",
+                crate::video_service::dump_capture_frame(display_idx, path, timeout_millis)
+            );
+            return None;
         } else if args[0] == "--assign" {
             if config::Config::no_register_device() {
                 println!("Cannot assign an unregistrable device!");

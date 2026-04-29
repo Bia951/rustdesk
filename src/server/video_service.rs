@@ -29,7 +29,7 @@ use crate::{
     ui_interface::is_installed,
 };
 use hbb_common::{
-    anyhow::anyhow,
+    anyhow::{anyhow, Error as AnyhowError},
     config,
     tokio::sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -53,8 +53,10 @@ use scrap::{
 use std::sync::Once;
 use std::{
     collections::HashSet,
+    fs,
     io::ErrorKind::WouldBlock,
     ops::{Deref, DerefMut},
+    path::Path,
     time::{self, Duration, Instant},
 };
 
@@ -369,12 +371,67 @@ pub fn test_capture_frame(display_idx: usize, timeout_millis: u64) -> String {
             Ok(msg) => return msg,
             Err(err) => {
                 if test_begin.elapsed().as_millis() >= timeout_millis as _ {
-                    return err.to_string();
+                    return format_error_chain(&err);
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+pub fn dump_capture_frame(display_idx: usize, path: &str, timeout_millis: u64) -> String {
+    let test_begin = Instant::now();
+    loop {
+        let result: ResultType<String> = (|| {
+            let mut displays = Display::all()?;
+            if displays.len() <= display_idx {
+                bail!(
+                    "Failed to get display {}, the displays' count is {}",
+                    display_idx,
+                    displays.len()
+                );
+            }
+            let display = displays.remove(display_idx);
+            let mut capturer = create_capturer(0, display, display_idx, false)?;
+            match capturer.frame(Duration::from_millis(0)) {
+                Ok(Frame::PixelBuffer(frame)) => {
+                    let width = frame.width();
+                    let height = frame.height();
+                    let rgba = get_rgba_from_pixelbuf(&frame)?;
+                    let png = encode_png(width, height, rgba)?;
+                    fs::write(Path::new(path), png)?;
+                    Ok(format!(
+                        "ok saved={} width={} height={} stride={} pixfmt={:?} bytes={}",
+                        path,
+                        width,
+                        height,
+                        frame.stride().get(0).copied().unwrap_or_default(),
+                        frame.pixfmt(),
+                        frame.data().len()
+                    ))
+                }
+                Ok(Frame::Texture(_)) => bail!("texture frame cannot be dumped as png here"),
+                Err(err) => Err(err.into()),
+            }
+        })();
+
+        match result {
+            Ok(msg) => return msg,
+            Err(err) => {
+                if test_begin.elapsed().as_millis() >= timeout_millis as _ {
+                    return format_error_chain(&err);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn format_error_chain(err: &AnyhowError) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 // Note: This function is extremely expensive, do not call it frequently.
@@ -455,7 +512,9 @@ fn get_capturer_monitor(
         }
     }
 
-    let (origin, width, height) = (display.origin(), display.width(), display.height());
+    let origin = display.origin();
+    let mut width = display.width();
+    let mut height = display.height();
     let name = display.name();
     log::debug!(
         "#displays={}, current={}, origin: {:?}, width={}, height={}, cpus={}/{}, name:{}",
@@ -504,6 +563,12 @@ fn get_capturer_monitor(
         current,
         portable_service_running,
     )?;
+    if let Some(capturer_width) = capturer.capturer_width() {
+        width = capturer_width;
+    }
+    if let Some(capturer_height) = capturer.capturer_height() {
+        height = capturer_height;
+    }
     Ok(CapturerInfo {
         origin,
         width,
@@ -990,6 +1055,7 @@ fn setup_encoder(
         last_portable_service_running,
         source,
     );
+    log::info!("selected encoder config: {encoder_cfg:?}");
     Encoder::set_fallback(&encoder_cfg);
     let codec_format = Encoder::negotiated_codec();
     let recorder = get_recorder(record_incoming, display_idx, source == VideoSource::Camera);
@@ -1015,6 +1081,17 @@ fn get_encoder_config(
     Encoder::update(scrap::codec::EncodingUpdate::Check);
     // https://www.wowza.com/community/t/the-correct-keyframe-interval-in-obs-studio/95162
     let keyframe_interval = if record { Some(240) } else { None };
+    #[cfg(target_os = "linux")]
+    if _source.is_monitor() && scrap::is_linux_kms_capture_backend() {
+        log::info!("kms capture backend uses VP9 software encoder for RAM frames");
+        return EncoderCfg::VPX(VpxEncoderConfig {
+            width: c.width as _,
+            height: c.height as _,
+            quality,
+            codec: VpxVideoCodecId::VP9,
+            keyframe_interval,
+        });
+    }
     let negotiated_codec = Encoder::negotiated_codec();
     match negotiated_codec {
         CodecFormat::H264 | CodecFormat::H265 => {
@@ -1194,6 +1271,9 @@ fn handle_one_frame(
     let mut send_conn_ids: HashSet<i32> = Default::default();
     let first = *first_frame;
     *first_frame = false;
+    if first {
+        log::info!("encoding first video frame for display {display}, size {width}x{height}");
+    }
     match encoder.encode_to_message(frame, ms) {
         Ok(mut vf) => {
             *encode_fail_counter = 0;
@@ -1206,6 +1286,12 @@ fn handle_one_frame(
                 .as_mut()
                 .map(|r| r.write_message(&msg, width, height));
             send_conn_ids = sp.send_video_frame(msg);
+            if first {
+                log::info!(
+                    "sent first video frame for display {display}, receivers={}",
+                    send_conn_ids.len()
+                );
+            }
         }
         Err(e) => {
             *encode_fail_counter += 1;
@@ -1425,6 +1511,14 @@ fn get_rgba_from_pixelbuf<'a>(pixbuf: &scrap::PixelBuffer<'a>) -> ResultType<Vec
     }
 }
 
+fn encode_png(width: usize, height: usize, rgba: Vec<u8>) -> ResultType<Vec<u8>> {
+    let mut png = Vec::new();
+    let mut encoder = repng::Options::smallest(width as _, height as _).build(&mut png)?;
+    encoder.write(&rgba)?;
+    encoder.finish()?;
+    Ok(png)
+}
+
 fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, data: Vec<u8>) {
     let mut response = ScreenshotResponse::new();
     response.sid = screenshot.sid;
@@ -1432,14 +1526,6 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
         if data.is_empty() {
             response.msg = "Failed to take screenshot, please try again later.".to_owned();
         } else {
-            fn encode_png(width: usize, height: usize, rgba: Vec<u8>) -> ResultType<Vec<u8>> {
-                let mut png = Vec::new();
-                let mut encoder =
-                    repng::Options::smallest(width as _, height as _).build(&mut png)?;
-                encoder.write(&rgba)?;
-                encoder.finish()?;
-                Ok(png)
-            }
             match encode_png(w as _, h as _, data) {
                 Ok(png) => {
                     response.data = png.into();

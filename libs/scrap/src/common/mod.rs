@@ -133,6 +133,14 @@ pub trait TraitCapturer {
     #[cfg(not(any(target_os = "ios")))]
     fn frame<'a>(&'a mut self, timeout: std::time::Duration) -> std::io::Result<Frame<'a>>;
 
+    fn capturer_width(&self) -> Option<usize> {
+        None
+    }
+
+    fn capturer_height(&self) -> Option<usize> {
+        None
+    }
+
     #[cfg(windows)]
     fn is_gdi(&self) -> bool;
     #[cfg(windows)]
@@ -309,6 +317,12 @@ pub fn linux_capture_backend() -> LinuxCaptureBackend {
 #[inline]
 pub fn is_linux_wayland_capture_backend() -> bool {
     linux_capture_backend() == LinuxCaptureBackend::Wayland
+}
+
+#[cfg(x11)]
+#[inline]
+pub fn is_linux_kms_capture_backend() -> bool {
+    linux_capture_backend() == LinuxCaptureBackend::Kms
 }
 
 #[cfg(x11)]

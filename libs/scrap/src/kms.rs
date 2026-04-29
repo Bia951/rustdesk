@@ -4,11 +4,15 @@ use serde::Deserialize;
 use std::{
     fs,
     fs::OpenOptions,
-    io,
+    io::{self, BufRead, BufReader, Read, Write},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     time::Duration,
 };
+
+const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const HELPER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct Display {
@@ -21,7 +25,6 @@ pub struct Display {
     online: bool,
     primary: bool,
     accessible: bool,
-    open_error: Option<String>,
 }
 
 impl Display {
@@ -99,7 +102,6 @@ impl Display {
             online: display.online,
             primary: false,
             accessible: display.can_open,
-            open_error: display.open_error,
         }
     }
 
@@ -127,7 +129,7 @@ impl Display {
             .map(|(card, _)| card)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid drm connector"))?;
         let card_path = PathBuf::from("/dev/dri").join(card_name);
-        let (accessible, open_error) = check_card_access(&card_path);
+        let (accessible, _) = check_card_access(&card_path);
 
         Ok(Some(Self {
             card_path,
@@ -139,7 +141,6 @@ impl Display {
             online: true,
             primary: false,
             accessible,
-            open_error,
         }))
     }
 }
@@ -151,33 +152,32 @@ pub struct Capturer {
     pixfmt: Pixfmt,
     stride: Vec<usize>,
     frame_data: Vec<u8>,
+    helper: Option<HelperSession>,
+    pending_frame: Option<HelperFrameOutput>,
+    privileged_attempted: bool,
 }
 
 impl Capturer {
     pub fn new(display: Display) -> io::Result<Capturer> {
-        if !display.accessible {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                display
-                    .open_error
-                    .clone()
-                    .unwrap_or_else(|| "failed to open drm device".to_owned()),
-            ));
-        }
         if !display.card_path().exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("DRM device '{}' not found", display.card_path().display()),
             ));
         }
-        Ok(Capturer {
+        let mut capturer = Capturer {
             width: display.width(),
             height: display.height(),
             display,
             pixfmt: Pixfmt::BGRA,
             stride: vec![0],
             frame_data: Vec::new(),
-        })
+            helper: None,
+            pending_frame: None,
+            privileged_attempted: false,
+        };
+        capturer.prime_frame()?;
+        Ok(capturer)
     }
 
     pub fn width(&self) -> usize {
@@ -191,7 +191,7 @@ impl Capturer {
 
 impl TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
-        let frame = query_helper_frame(&self.display.name())?;
+        let frame = self.next_frame()?;
         let same_layout = self.width == frame.width
             && self.height == frame.height
             && self.pixfmt == frame.pixfmt
@@ -211,6 +211,81 @@ impl TraitCapturer for Capturer {
             self.width,
             self.height,
         )))
+    }
+}
+
+impl Capturer {
+    fn prime_frame(&mut self) -> io::Result<()> {
+        let frame = self.read_helper_frame()?;
+        if self.width != frame.width || self.height != frame.height {
+            log::info!(
+                "kms capture frame size differs from display mode: {}x{} -> {}x{}",
+                self.width,
+                self.height,
+                frame.width,
+                frame.height
+            );
+        }
+        self.width = frame.width;
+        self.height = frame.height;
+        self.pixfmt = frame.pixfmt;
+        self.stride = frame.stride.clone();
+        self.pending_frame = Some(frame);
+        Ok(())
+    }
+
+    fn next_frame(&mut self) -> io::Result<HelperFrameOutput> {
+        if let Some(frame) = self.pending_frame.take() {
+            return Ok(frame);
+        }
+        self.read_helper_frame()
+    }
+
+    fn read_helper_frame(&mut self) -> io::Result<HelperFrameOutput> {
+        if self.helper.is_none() {
+            let privileged = !self.display.accessible;
+            if let Err(err) = self.spawn_helper(privileged) {
+                return self.retry_privileged_or_return(err);
+            }
+        }
+
+        let frame = match self.helper.as_mut() {
+            Some(helper) => helper.frame(),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "kms helper session unavailable",
+            )),
+        };
+
+        match frame {
+            Ok(frame) => Ok(frame),
+            Err(err) => self.retry_privileged_or_return(err),
+        }
+    }
+
+    fn spawn_helper(&mut self, privileged: bool) -> io::Result<()> {
+        if privileged {
+            self.privileged_attempted = true;
+        }
+        let helper = HelperSession::spawn(&self.display.name(), privileged)?;
+        self.helper = Some(helper);
+        Ok(())
+    }
+
+    fn retry_privileged_or_return(&mut self, err: io::Error) -> io::Result<HelperFrameOutput> {
+        self.helper = None;
+        if self.privileged_attempted || !should_retry_privileged_message(&err.to_string()) {
+            return Err(err);
+        }
+
+        self.spawn_helper(true)?;
+        match self.helper.as_mut() {
+            Some(helper) => helper.frame(),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "privileged kms helper session unavailable",
+            )),
+        }
     }
 }
 
@@ -248,42 +323,6 @@ fn query_helper_displays() -> io::Result<Vec<HelperDisplay>> {
     Ok(response.displays)
 }
 
-fn query_helper_frame(display_name: &str) -> io::Result<HelperFrameOutput> {
-    let output = run_helper(["frame", display_name])?;
-    let split = output
-        .stdout
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing kms helper header"))?;
-    let header: HelperFrameHeader = serde_json::from_slice(&output.stdout[..split])
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-    let data = output.stdout[split + 1..].to_vec();
-    if data.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "kms helper returned an empty frame",
-        ));
-    }
-    if data.len() != header.byte_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "kms helper frame length mismatch: expected {}, got {}",
-                header.byte_len,
-                data.len()
-            ),
-        ));
-    }
-
-    Ok(HelperFrameOutput {
-        width: header.width,
-        height: header.height,
-        stride: vec![header.stride],
-        pixfmt: parse_pixfmt(&header.pixfmt)?,
-        data,
-    })
-}
-
 fn run_helper<const N: usize>(args: [&str; N]) -> io::Result<std::process::Output> {
     let output = Command::new(std::env::current_exe()?)
         .arg("--kms-helper")
@@ -308,6 +347,14 @@ fn run_helper<const N: usize>(args: [&str; N]) -> io::Result<std::process::Outpu
         return Err(io::Error::new(kind, message));
     }
     Ok(output)
+}
+
+fn should_retry_privileged_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("no accessible gem handle")
+        || lower.contains("no active framebuffer")
 }
 
 fn parse_pixfmt(pixfmt: &str) -> io::Result<Pixfmt> {
@@ -336,7 +383,6 @@ struct HelperDisplay {
     height: usize,
     online: bool,
     can_open: bool,
-    open_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -354,4 +400,163 @@ struct HelperFrameOutput {
     stride: Vec<usize>,
     pixfmt: Pixfmt,
     data: Vec<u8>,
+}
+
+struct HelperSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl HelperSession {
+    fn spawn(display_name: &str, privileged: bool) -> io::Result<Self> {
+        let mut command = if privileged {
+            let mut command = Command::new("pkexec");
+            command.arg("--disable-internal-agent");
+            command.arg(std::env::current_exe()?);
+            command
+        } else {
+            Command::new(std::env::current_exe()?)
+        };
+
+        log::info!(
+            "starting {} kms helper stream for {}",
+            if privileged { "privileged" } else { "unprivileged" },
+            display_name
+        );
+
+        let mut child = command
+            .arg("--kms-helper")
+            .arg(if privileged {
+                "stream-privileged"
+            } else {
+                "stream"
+            })
+            .arg(display_name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "kms helper stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "kms helper stdout unavailable"))?;
+
+        let mut session = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let mut ready = String::new();
+        session.wait_for_stdout(HELPER_READY_TIMEOUT, "kms helper ready")?;
+        let read = session.stdout.read_line(&mut ready)?;
+        if read == 0 {
+            return Err(session.child_error("kms helper exited before ready"));
+        }
+        if ready.trim() != "ready" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected kms helper ready message: {}", ready.trim()),
+            ));
+        }
+        log::info!(
+            "{} kms helper stream is ready for {}",
+            if privileged { "privileged" } else { "unprivileged" },
+            display_name
+        );
+        Ok(session)
+    }
+
+    fn frame(&mut self) -> io::Result<HelperFrameOutput> {
+        self.stdin.write_all(b"frame\n")?;
+        self.stdin.flush()?;
+
+        let mut header = Vec::new();
+        self.wait_for_stdout(HELPER_FRAME_TIMEOUT, "kms helper frame header")?;
+        let read = self.stdout.read_until(b'\n', &mut header)?;
+        if read == 0 {
+            return Err(self.child_error("kms helper exited before frame header"));
+        }
+        if header.last() == Some(&b'\n') {
+            header.pop();
+        }
+        let header: HelperFrameHeader = serde_json::from_slice(&header)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        let mut data = vec![0u8; header.byte_len];
+        self.stdout.read_exact(&mut data)?;
+        Ok(HelperFrameOutput {
+            width: header.width,
+            height: header.height,
+            stride: vec![header.stride],
+            pixfmt: parse_pixfmt(&header.pixfmt)?,
+            data,
+        })
+    }
+
+    fn wait_for_stdout(&self, timeout: Duration, context: &str) -> io::Result<()> {
+        let timeout_ms = timeout
+            .as_millis()
+            .min(i32::MAX as u128)
+            as i32;
+        let mut pollfd = crate::libc::pollfd {
+            fd: self.stdout.get_ref().as_raw_fd(),
+            events: crate::libc::POLLIN | crate::libc::POLLHUP | crate::libc::POLLERR,
+            revents: 0,
+        };
+        let ret = unsafe { crate::libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{context} timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        if pollfd.revents & crate::libc::POLLERR != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("{context} pipe error"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn child_error(&mut self, fallback: &str) -> io::Error {
+        let mut stderr = String::new();
+        if let Some(stderr_pipe) = self.child.stderr.as_mut() {
+            let _ = stderr_pipe.read_to_string(&mut stderr);
+        }
+        let message = if stderr.trim().is_empty() {
+            fallback.to_owned()
+        } else {
+            stderr.trim().to_owned()
+        };
+        let kind = if should_retry_privileged_message(&message) {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, message)
+    }
+}
+
+impl Drop for HelperSession {
+    fn drop(&mut self) {
+        let _ = self.stdin.write_all(b"quit\n");
+        let _ = self.stdin.flush();
+        for _ in 0..10 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

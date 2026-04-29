@@ -93,8 +93,9 @@ pub(super) fn check_display_changed(
 ) -> Option<DisplayInfo> {
     #[cfg(target_os = "linux")]
     {
-        // wayland do not support changing display for now
-        if scrap::is_linux_wayland_capture_backend() {
+        // Wayland and the experimental KMS backend do not use this X11-style
+        // display geometry switch path.
+        if scrap::is_linux_wayland_capture_backend() || scrap::is_linux_kms_capture_backend() {
             return None;
         }
     }
