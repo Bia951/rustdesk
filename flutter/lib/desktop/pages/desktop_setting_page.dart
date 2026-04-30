@@ -583,10 +583,10 @@ class _GeneralState extends State<_General> {
     if (isLinux && !bind.isOutgoingOnly()) {
       children.add(
         Tooltip(
-          message: translate('kmsgrab_capture_tip'),
+          message: translate('kms_capture_tip'),
           child: _OptionCheckBox(
             context,
-            'Use kmsgrab as graphics capture backend',
+            'Use KMS as graphics capture backend',
             kOptionLinuxCaptureBackend,
             optGetter: () =>
                 bind
