@@ -632,6 +632,31 @@ fn get_capturer(
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::main(flavor = "current_thread")]
+async fn update_kms_uinput_resolution(c: &CapturerInfo) -> ResultType<()> {
+    let minx = c.origin.0;
+    let miny = c.origin.1;
+    let maxx = minx.saturating_add(c.width as i32);
+    let maxy = miny.saturating_add(c.height as i32);
+    log::info!(
+        "update KMS uinput mouse resolution: ({}, {}), ({}, {})",
+        minx,
+        maxx,
+        miny,
+        maxy
+    );
+    crate::input_service::update_mouse_resolution(minx, maxx, miny, maxy).await
+}
+
+#[cfg(target_os = "linux")]
+fn pixel_frame_size(frame: &Frame<'_>) -> Option<(usize, usize)> {
+    match frame {
+        Frame::PixelBuffer(frame) => Some((frame.width(), frame.height())),
+        Frame::Texture(_) => None,
+    }
+}
+
 fn run(vs: VideoService) -> ResultType<()> {
     let mut _raii = Raii::new(vs.idx, vs.sp.name());
     // Wayland only support one video capturer for now. It is ok to call ensure_inited() here.
@@ -672,6 +697,15 @@ fn run(vs: VideoService) -> ResultType<()> {
     let display_idx = vs.idx;
     let sp = vs.sp;
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+    #[cfg(target_os = "linux")]
+    if vs.source.is_monitor()
+        && scrap::is_linux_kms_capture_backend()
+        && crate::input_service::wayland_use_uinput()
+    {
+        if let Err(err) = update_kms_uinput_resolution(&c) {
+            log::warn!("Failed to update KMS uinput resolution: {err}");
+        }
+    }
     #[cfg(windows)]
     if !scrap::codec::enable_directx_capture() && !c.is_gdi() {
         log::info!("disable dxgi with option, fall back to gdi");
@@ -830,6 +864,22 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    #[cfg(target_os = "linux")]
+                    if vs.source.is_monitor() && scrap::is_linux_kms_capture_backend() {
+                        if let Some((frame_width, frame_height)) = pixel_frame_size(&frame) {
+                            if frame_width != capture_width || frame_height != capture_height {
+                                log::info!(
+                                    "switch due to KMS frame size changed: {}x{} -> {}x{}",
+                                    capture_width,
+                                    capture_height,
+                                    frame_width,
+                                    frame_height
+                                );
+                                bail!("SWITCH");
+                            }
+                        }
+                    }
+
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&display_idx);
                     if let Some(mut screenshot) = screenshot {
                         let restore_vram = screenshot.restore_vram;

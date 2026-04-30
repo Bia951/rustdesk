@@ -188,7 +188,10 @@ pub mod service {
     use scrap::wayland::{
         pipewire::RDP_SESSION_INFO, remote_desktop_portal::OrgFreedesktopPortalRemoteDesktop,
     };
-    use std::{collections::HashMap, sync::Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, Once},
+    };
 
     lazy_static::lazy_static! {
     static ref KEY_MAP: HashMap<enigo::Key, evdev::Key> = HashMap::from(
@@ -945,11 +948,26 @@ pub mod service {
         start_service(IPC_POSTFIX_MOUSE, spawn_mouse_handler).await;
     }
 
-    /// Start uinput mouse service.
+    /// Start uinput control service.
     #[tokio::main(flavor = "current_thread")]
     pub async fn start_service_control() {
         log::info!("start uinput control service");
         start_service(IPC_POSTFIX_CONTROL, spawn_controller_handler).await;
+    }
+
+    pub fn start_services_once() {
+        static START: Once = Once::new();
+        START.call_once(|| {
+            std::thread::spawn(|| {
+                start_service_control();
+            });
+            std::thread::spawn(|| {
+                start_service_keyboard();
+            });
+            std::thread::spawn(|| {
+                start_service_mouse();
+            });
+        });
     }
 
     pub fn stop_service_keyboard() {

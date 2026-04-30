@@ -336,16 +336,7 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
 }
 
 fn start_uinput_service() {
-    use crate::server::uinput::service;
-    std::thread::spawn(|| {
-        service::start_service_control();
-    });
-    std::thread::spawn(|| {
-        service::start_service_keyboard();
-    });
-    std::thread::spawn(|| {
-        service::start_service_mouse();
-    });
+    crate::server::uinput::service::start_services_once();
 }
 
 /// Suggests the best terminal type based on the environment.

@@ -607,7 +607,7 @@ static mut VIRTUAL_INPUT_STATE: Option<VirtualInputState> = None;
 pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
     // Keyboard and mouse both open /dev/uinput
     // TODO: Make sure there's no race
-    set_uinput_resolution(minx, maxx, miny, maxy).await?;
+    set_uinput_resolution_or_start_service(minx, maxx, miny, maxy).await?;
 
     let keyboard = super::uinput::client::UInputKeyboard::new().await?;
     log::info!("UInput keyboard created");
@@ -620,6 +620,43 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
         .set_custom_keyboard(Box::new(keyboard));
     ENIGO.lock().unwrap().set_custom_mouse(Box::new(mouse));
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn set_uinput_resolution_or_start_service(
+    minx: i32,
+    maxx: i32,
+    miny: i32,
+    maxy: i32,
+) -> ResultType<()> {
+    match set_uinput_resolution(minx, maxx, miny, maxy).await {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            if !crate::platform::is_root() {
+                log::warn!(
+                    "uinput IPC is unavailable; start the RustDesk service as root for Wayland/KMS input: {}",
+                    first_err
+                );
+                return Err(first_err);
+            }
+
+            log::warn!(
+                "uinput IPC is unavailable; starting embedded uinput service for this server process: {}",
+                first_err
+            );
+            super::uinput::service::start_services_once();
+
+            let mut last_err = first_err;
+            for _ in 0..15 {
+                hbb_common::tokio::time::sleep(Duration::from_millis(100)).await;
+                match set_uinput_resolution(minx, maxx, miny, maxy).await {
+                    Ok(()) => return Ok(()),
+                    Err(err) => last_err = err,
+                }
+            }
+            Err(last_err)
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -653,7 +690,7 @@ pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
 
 #[cfg(target_os = "linux")]
 pub async fn update_mouse_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
-    set_uinput_resolution(minx, maxx, miny, maxy).await?;
+    set_uinput_resolution_or_start_service(minx, maxx, miny, maxy).await?;
 
     std::thread::spawn(|| {
         if let Some(mouse) = ENIGO.lock().unwrap().get_custom_mouse() {
@@ -2214,13 +2251,14 @@ async fn send_sas() -> ResultType<()> {
 #[inline]
 #[cfg(target_os = "linux")]
 pub fn wayland_use_uinput() -> bool {
-    !crate::platform::is_x11() && crate::is_server()
+    !crate::platform::is_x11()
+        && (crate::is_server() || scrap::is_linux_kms_capture_backend())
 }
 
 #[inline]
 #[cfg(target_os = "linux")]
 pub fn wayland_use_rdp_input() -> bool {
-    !crate::platform::is_x11() && !crate::is_server()
+    !crate::platform::is_x11() && !wayland_use_uinput()
 }
 
 #[cfg(target_os = "linux")]
