@@ -13,7 +13,8 @@ use std::{
     fs,
     fs::OpenOptions,
     io::{self, BufRead, BufReader, ErrorKind, Write},
-    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -57,6 +58,29 @@ struct FrameCapture {
     bytes: Vec<u8>,
 }
 
+#[derive(Serialize)]
+struct DmabufFrameOutput {
+    card_path: String,
+    connector_path: String,
+    name: String,
+    width: usize,
+    height: usize,
+    fourcc: u32,
+    modifier: u64,
+    planes: Vec<DmabufPlaneOutput>,
+}
+
+#[derive(Serialize)]
+struct DmabufPlaneOutput {
+    stride: u32,
+    offset: u32,
+}
+
+struct DmabufFrameCapture {
+    header: DmabufFrameOutput,
+    fds: Vec<OwnedFd>,
+}
+
 struct Card(std::fs::File);
 
 impl AsFd for Card {
@@ -87,6 +111,16 @@ pub fn run(args: &[String]) -> ResultType<()> {
             let display_name = args.get(1).context("missing kms helper display name")?;
             stream(display_name, true)
         }
+        Some("dmabuf-stream") => {
+            let display_name = args.get(1).context("missing kms helper display name")?;
+            let socket_path = args.get(2).context("missing kms helper dmabuf socket")?;
+            stream_dmabuf(display_name, socket_path, false)
+        }
+        Some("dmabuf-stream-privileged") => {
+            let display_name = args.get(1).context("missing kms helper display name")?;
+            let socket_path = args.get(2).context("missing kms helper dmabuf socket")?;
+            stream_dmabuf(display_name, socket_path, true)
+        }
         Some(cmd) => bail!("unsupported kms helper command: {cmd}"),
         None => bail!("missing kms helper command"),
     }
@@ -108,6 +142,57 @@ fn write_frame(frame: &FrameCapture) -> ResultType<()> {
     stdout.write_all(b"\n")?;
     stdout.write_all(&frame.bytes)?;
     stdout.flush()?;
+    Ok(())
+}
+
+fn write_dmabuf_frame(socket: &UnixStream, frame: &DmabufFrameCapture) -> ResultType<()> {
+    let mut header = serde_json::to_vec(&frame.header)?;
+    header.push(b'\n');
+    let fds = frame
+        .fds
+        .iter()
+        .map(AsRawFd::as_raw_fd)
+        .collect::<Vec<_>>();
+    send_fds(socket.as_raw_fd(), &header, &fds)?;
+    Ok(())
+}
+
+fn cmsg_align(len: usize) -> usize {
+    let align = std::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+fn send_fds(socket_fd: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let fd_bytes = std::mem::size_of_val(fds);
+    let control_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(fd_bytes);
+    let mut control = vec![0_u8; control_len];
+    let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = (cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + fd_bytes) as _;
+        let data = control
+            .as_mut_ptr()
+            .add(cmsg_align(std::mem::size_of::<libc::cmsghdr>()))
+            .cast::<RawFd>();
+        std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
+        let msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: control.as_mut_ptr().cast::<libc::c_void>(),
+            msg_controllen: control.len() as _,
+            msg_flags: 0,
+        };
+        if libc::sendmsg(socket_fd, &msg, 0) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(())
 }
 
@@ -186,6 +271,48 @@ fn stream(display_name: &str, privileged: bool) -> ResultType<()> {
             "quit" => break,
             "" => {}
             cmd => bail!("unsupported kms helper stream command: {cmd}"),
+        }
+    }
+    Ok(())
+}
+
+fn stream_dmabuf(display_name: &str, socket_path: &str, privileged: bool) -> ResultType<()> {
+    let display = find_display(display_name)?;
+    if !privileged && !display.can_open {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            display
+                .open_error
+                .clone()
+                .unwrap_or_else(|| "failed to open drm device".to_owned()),
+        )
+        .into());
+    }
+
+    let card = Card(open_card(Path::new(&display.card_path))?);
+    let socket = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect kms dmabuf socket {socket_path}"))?;
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(b"ready\n")?;
+    stdout.flush()?;
+    drop(stdout);
+
+    let stdin = io::stdin();
+    let mut stdin = BufReader::new(stdin.lock());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = stdin.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        match line.trim() {
+            "frame" => write_dmabuf_frame(&socket, &capture_dmabuf_frame(&card, &display, privileged)?)?,
+            "quit" => break,
+            "" => {}
+            cmd => bail!("unsupported kms helper dmabuf stream command: {cmd}"),
         }
     }
     Ok(())
@@ -351,6 +478,43 @@ fn capture_frame(
     bail!("crtc has no active framebuffer")
 }
 
+fn capture_dmabuf_frame(
+    card: &Card,
+    display: &ProbeDisplay,
+    privileged: bool,
+) -> ResultType<DmabufFrameCapture> {
+    configure_card(card, privileged);
+    let connector_name = display
+        .name
+        .split_once('-')
+        .map(|(_, name)| name)
+        .context("invalid display name")?;
+    let resources = card.resource_handles()?;
+    let connector = resolve_connector(card, connector_name, resources.connectors())?;
+    let encoder_handle = connector
+        .current_encoder()
+        .or_else(|| connector.encoders().first().copied())
+        .context("connector has no active encoder")?;
+    let encoder = card.get_encoder(encoder_handle)?;
+    let crtc_handle = encoder
+        .crtc()
+        .or_else(|| {
+            resources
+                .filter_crtcs(encoder.possible_crtcs())
+                .into_iter()
+                .next()
+        })
+        .context("encoder has no active CRTC")?;
+    let crtc = card.get_crtc(crtc_handle)?;
+    let framebuffers =
+        resolve_framebuffers(card, crtc_handle, &crtc, display.width, display.height)?;
+    let framebuffer = framebuffers
+        .into_iter()
+        .next()
+        .context("crtc has no active framebuffer")?;
+    capture_framebuffer_dmabuf(card, display, framebuffer)
+}
+
 fn capture_framebuffer(
     card: &Card,
     display: &ProbeDisplay,
@@ -422,6 +586,63 @@ fn capture_framebuffer(
             byte_len: bytes.len(),
         },
         bytes,
+    })
+}
+
+fn capture_framebuffer_dmabuf(
+    card: &Card,
+    display: &ProbeDisplay,
+    framebuffer: control::framebuffer::Handle,
+) -> ResultType<DmabufFrameCapture> {
+    let legacy = card.get_framebuffer(framebuffer)?;
+    let planar = match card.get_planar_framebuffer(framebuffer) {
+        Ok(planar) => planar,
+        Err(control::GetPlanarFramebufferError::Io(err)) => return Err(err.into()),
+        Err(control::GetPlanarFramebufferError::UnrecognizedFourcc(err)) => {
+            return Err(io::Error::new(
+                ErrorKind::Unsupported,
+                format!("unsupported framebuffer format: {err}"),
+            )
+            .into())
+        }
+    };
+
+    let drm_format = planar.pixel_format();
+    let modifier = planar
+        .modifier()
+        .map(u64::from)
+        .unwrap_or_else(|| u64::from(drm::buffer::DrmModifier::Linear));
+    let buffers = planar.buffers();
+    let fallback_buffer = legacy.buffer();
+    let mut planes = Vec::new();
+    let mut fds = Vec::new();
+    for (idx, handle) in buffers.iter().enumerate() {
+        let handle = match handle.or(if idx == 0 { fallback_buffer } else { None }) {
+            Some(handle) => handle,
+            None => continue,
+        };
+        fds.push(card.buffer_to_prime_fd(handle, 0)?);
+        planes.push(DmabufPlaneOutput {
+            stride: planar.pitches()[idx],
+            offset: planar.offsets()[idx],
+        });
+    }
+    if planes.is_empty() {
+        bail!("framebuffer has no exportable dmabuf planes");
+    }
+
+    Ok(DmabufFrameCapture {
+        header: DmabufFrameOutput {
+            card_path: display.card_path.clone(),
+            connector_path: display.connector_path.clone(),
+            name: display.name.clone(),
+            width: planar.size().0 as usize,
+            height: planar.size().1 as usize,
+            fourcc: drm_format as u32,
+            modifier,
+            planes,
+        },
+        fds,
     })
 }
 

@@ -7,6 +7,8 @@ use hbb_common::{
     ResultType,
 };
 use std::{ffi::c_void, slice};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, OwnedFd};
 
 cfg_if! {
     if #[cfg(quartz)] {
@@ -182,10 +184,40 @@ pub trait TraitPixelBuffer {
     fn pixfmt(&self) -> Pixfmt;
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct DmabufPlane {
+    pub fd: OwnedFd,
+    pub stride: u32,
+    pub offset: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct DmabufFrame {
+    pub width: usize,
+    pub height: usize,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub planes: Vec<DmabufPlane>,
+}
+
+#[cfg(target_os = "linux")]
+impl DmabufFrame {
+    pub fn valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && !self.planes.is_empty()
+            && self.planes.iter().all(|plane| plane.fd.as_raw_fd() >= 0)
+    }
+}
+
 #[cfg(not(any(target_os = "ios")))]
 pub enum Frame<'a> {
     PixelBuffer(PixelBuffer<'a>),
     Texture((*mut c_void, usize)),
+    #[cfg(target_os = "linux")]
+    Dmabuf(DmabufFrame),
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -194,6 +226,8 @@ impl Frame<'_> {
         match self {
             Frame::PixelBuffer(pixelbuffer) => !pixelbuffer.data().is_empty(),
             Frame::Texture((texture, _)) => !texture.is_null(),
+            #[cfg(target_os = "linux")]
+            Frame::Dmabuf(frame) => frame.valid(),
         }
     }
 
@@ -209,6 +243,8 @@ impl Frame<'_> {
                 Ok(EncodeInput::YUV(yuv))
             }
             Frame::Texture(texture) => Ok(EncodeInput::Texture(*texture)),
+            #[cfg(target_os = "linux")]
+            Frame::Dmabuf(frame) => Ok(EncodeInput::Dmabuf(frame)),
         }
     }
 }
@@ -216,6 +252,8 @@ impl Frame<'_> {
 pub enum EncodeInput<'a> {
     YUV(&'a [u8]),
     Texture((*mut c_void, usize)),
+    #[cfg(target_os = "linux")]
+    Dmabuf(&'a DmabufFrame),
 }
 
 impl<'a> EncodeInput<'a> {
@@ -230,6 +268,14 @@ impl<'a> EncodeInput<'a> {
         match self {
             Self::Texture(f) => Ok(*f),
             _ => bail!("not texture frame"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf(&self) -> ResultType<&'_ DmabufFrame> {
+        match self {
+            Self::Dmabuf(f) => Ok(*f),
+            _ => bail!("not dmabuf frame"),
         }
     }
 }

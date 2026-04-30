@@ -367,6 +367,15 @@ pub fn test_capture_frame(display_idx: usize, timeout_millis: u64) -> String {
                     frame.data().len()
                 )),
                 Ok(Frame::Texture(_)) => Ok("ok texture-frame".to_owned()),
+                #[cfg(target_os = "linux")]
+                Ok(Frame::Dmabuf(frame)) => Ok(format!(
+                    "ok dmabuf-frame width={} height={} fourcc={} modifier={} planes={}",
+                    frame.width,
+                    frame.height,
+                    frame.fourcc,
+                    frame.modifier,
+                    frame.planes.len()
+                )),
                 Err(err) => Err(err.into()),
             }
         })();
@@ -415,6 +424,8 @@ pub fn dump_capture_frame(display_idx: usize, path: &str, timeout_millis: u64) -
                     ))
                 }
                 Ok(Frame::Texture(_)) => bail!("texture frame cannot be dumped as png here"),
+                #[cfg(target_os = "linux")]
+                Ok(Frame::Dmabuf(_)) => bail!("dmabuf frame cannot be dumped as png here"),
                 Err(err) => Err(err.into()),
             }
         })();
@@ -658,6 +669,8 @@ fn pixel_frame_size(frame: &Frame<'_>) -> Option<(usize, usize)> {
     match frame {
         Frame::PixelBuffer(frame) => Some((frame.width(), frame.height())),
         Frame::Texture(_) => None,
+        #[cfg(target_os = "linux")]
+        Frame::Dmabuf(frame) => Some((frame.width, frame.height)),
     }
 }
 
@@ -922,6 +935,13 @@ fn run(vs: VideoService) -> ResultType<()> {
                                     bail!("SWITCH");
                                 }
                             }
+                            #[cfg(target_os = "linux")]
+                            scrap::Frame::Dmabuf(_) => (
+                                "Dmabuf screenshots are not supported yet.".to_owned(),
+                                0,
+                                0,
+                                vec![],
+                            ),
                         };
                         std::thread::spawn(move || {
                             handle_screenshot(screenshot, msg, w, h, data);

@@ -692,6 +692,10 @@ pub mod server {
                         Frame::Texture(_) => {
                             // should not happen
                         }
+                        #[cfg(target_os = "linux")]
+                        Frame::Dmabuf(_) => {
+                            // Portable capture currently exchanges CPU-backed frames only.
+                        }
                     },
                     Some(Err(e)) => {
                         if crate::platform::windows::desktop_changed() {

@@ -1,18 +1,22 @@
-use crate::{common::would_block_if_equal, Frame, PixelBuffer, Pixfmt, TraitCapturer};
+use crate::{common::would_block_if_equal, DmabufFrame, DmabufPlane, Frame, PixelBuffer, Pixfmt, TraitCapturer};
 use hbb_common::log;
 use serde::Deserialize;
 use std::{
     fs,
     fs::OpenOptions,
     io::{self, BufRead, BufReader, Read, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const HELPER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const OPTION_KMS_DMABUF: &str = "RUSTDESK_KMS_DMABUF";
+static DMABUF_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct Display {
@@ -153,8 +157,10 @@ pub struct Capturer {
     stride: Vec<usize>,
     frame_data: Vec<u8>,
     helper: Option<HelperSession>,
-    pending_frame: Option<HelperFrameOutput>,
+    dmabuf_helper: Option<HelperDmabufSession>,
+    pending_frame: Option<CapturedFrame>,
     privileged_attempted: bool,
+    use_dmabuf: bool,
 }
 
 impl Capturer {
@@ -173,8 +179,10 @@ impl Capturer {
             stride: vec![0],
             frame_data: Vec::new(),
             helper: None,
+            dmabuf_helper: None,
             pending_frame: None,
             privileged_attempted: false,
+            use_dmabuf: use_dmabuf_capture(),
         };
         capturer.prime_frame()?;
         Ok(capturer)
@@ -191,54 +199,73 @@ impl Capturer {
 
 impl TraitCapturer for Capturer {
     fn frame<'a>(&'a mut self, _timeout: Duration) -> io::Result<Frame<'a>> {
-        let frame = self.next_frame()?;
-        let same_layout = self.width == frame.width
-            && self.height == frame.height
-            && self.pixfmt == frame.pixfmt
-            && self.stride == frame.stride;
-        if same_layout {
-            would_block_if_equal(&mut self.frame_data, &frame.data)?;
-        } else {
-            self.frame_data = frame.data;
+        match self.next_frame()? {
+            CapturedFrame::Pixel(frame) => {
+                let same_layout = self.width == frame.width
+                    && self.height == frame.height
+                    && self.pixfmt == frame.pixfmt
+                    && self.stride == frame.stride;
+                if same_layout {
+                    would_block_if_equal(&mut self.frame_data, &frame.data)?;
+                } else {
+                    self.frame_data = frame.data;
+                }
+                self.width = frame.width;
+                self.height = frame.height;
+                self.pixfmt = frame.pixfmt;
+                self.stride = frame.stride;
+                Ok(Frame::PixelBuffer(PixelBuffer::new(
+                    &self.frame_data,
+                    self.pixfmt,
+                    self.width,
+                    self.height,
+                )))
+            }
+            CapturedFrame::Dmabuf(frame) => {
+                self.width = frame.width;
+                self.height = frame.height;
+                Ok(Frame::Dmabuf(frame))
+            }
         }
-        self.width = frame.width;
-        self.height = frame.height;
-        self.pixfmt = frame.pixfmt;
-        self.stride = frame.stride;
-        Ok(Frame::PixelBuffer(PixelBuffer::new(
-            &self.frame_data,
-            self.pixfmt,
-            self.width,
-            self.height,
-        )))
     }
 }
 
 impl Capturer {
     fn prime_frame(&mut self) -> io::Result<()> {
-        let frame = self.read_helper_frame()?;
-        if self.width != frame.width || self.height != frame.height {
+        let frame = self.read_frame()?;
+        let (width, height) = frame.size();
+        if self.width != width || self.height != height {
             log::info!(
                 "kms capture frame size differs from display mode: {}x{} -> {}x{}",
                 self.width,
                 self.height,
-                frame.width,
-                frame.height
+                width,
+                height
             );
         }
-        self.width = frame.width;
-        self.height = frame.height;
-        self.pixfmt = frame.pixfmt;
-        self.stride = frame.stride.clone();
+        self.width = width;
+        self.height = height;
+        if let CapturedFrame::Pixel(frame) = &frame {
+            self.pixfmt = frame.pixfmt;
+            self.stride = frame.stride.clone();
+        }
         self.pending_frame = Some(frame);
         Ok(())
     }
 
-    fn next_frame(&mut self) -> io::Result<HelperFrameOutput> {
+    fn next_frame(&mut self) -> io::Result<CapturedFrame> {
         if let Some(frame) = self.pending_frame.take() {
             return Ok(frame);
         }
-        self.read_helper_frame()
+        self.read_frame()
+    }
+
+    fn read_frame(&mut self) -> io::Result<CapturedFrame> {
+        if self.use_dmabuf {
+            self.read_helper_dmabuf_frame().map(CapturedFrame::Dmabuf)
+        } else {
+            self.read_helper_frame().map(CapturedFrame::Pixel)
+        }
     }
 
     fn read_helper_frame(&mut self) -> io::Result<HelperFrameOutput> {
@@ -263,12 +290,43 @@ impl Capturer {
         }
     }
 
+    fn read_helper_dmabuf_frame(&mut self) -> io::Result<DmabufFrame> {
+        if self.dmabuf_helper.is_none() {
+            let privileged = !self.display.accessible;
+            if let Err(err) = self.spawn_dmabuf_helper(privileged) {
+                return self.retry_privileged_dmabuf_or_return(err);
+            }
+        }
+
+        let frame = match self.dmabuf_helper.as_mut() {
+            Some(helper) => helper.frame(),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "kms dmabuf helper session unavailable",
+            )),
+        };
+
+        match frame {
+            Ok(frame) => Ok(frame),
+            Err(err) => self.retry_privileged_dmabuf_or_return(err),
+        }
+    }
+
     fn spawn_helper(&mut self, privileged: bool) -> io::Result<()> {
         if privileged {
             self.privileged_attempted = true;
         }
         let helper = HelperSession::spawn(&self.display.name(), privileged)?;
         self.helper = Some(helper);
+        Ok(())
+    }
+
+    fn spawn_dmabuf_helper(&mut self, privileged: bool) -> io::Result<()> {
+        if privileged {
+            self.privileged_attempted = true;
+        }
+        let helper = HelperDmabufSession::spawn(&self.display.name(), privileged)?;
+        self.dmabuf_helper = Some(helper);
         Ok(())
     }
 
@@ -287,6 +345,43 @@ impl Capturer {
             )),
         }
     }
+
+    fn retry_privileged_dmabuf_or_return(&mut self, err: io::Error) -> io::Result<DmabufFrame> {
+        self.dmabuf_helper = None;
+        if self.privileged_attempted || !should_retry_privileged_message(&err.to_string()) {
+            return Err(err);
+        }
+
+        log::warn!("retrying kms dmabuf capture with privileged helper after: {err}");
+        self.spawn_dmabuf_helper(true)?;
+        match self.dmabuf_helper.as_mut() {
+            Some(helper) => helper.frame(),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "privileged kms dmabuf helper session unavailable",
+            )),
+        }
+    }
+}
+
+enum CapturedFrame {
+    Pixel(HelperFrameOutput),
+    Dmabuf(DmabufFrame),
+}
+
+impl CapturedFrame {
+    fn size(&self) -> (usize, usize) {
+        match self {
+            CapturedFrame::Pixel(frame) => (frame.width, frame.height),
+            CapturedFrame::Dmabuf(frame) => (frame.width, frame.height),
+        }
+    }
+}
+
+fn use_dmabuf_capture() -> bool {
+    std::env::var(OPTION_KMS_DMABUF)
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "y" | "yes"))
+        .unwrap_or(false)
 }
 
 fn read_trimmed(path: PathBuf) -> io::Result<String> {
@@ -400,6 +495,21 @@ struct HelperFrameOutput {
     stride: Vec<usize>,
     pixfmt: Pixfmt,
     data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct HelperDmabufHeader {
+    width: usize,
+    height: usize,
+    fourcc: u32,
+    modifier: u64,
+    planes: Vec<HelperDmabufPlane>,
+}
+
+#[derive(Deserialize)]
+struct HelperDmabufPlane {
+    stride: u32,
+    offset: u32,
 }
 
 struct HelperSession {
@@ -559,4 +669,321 @@ impl Drop for HelperSession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+struct HelperDmabufSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    socket: UnixStream,
+    socket_path: PathBuf,
+}
+
+impl HelperDmabufSession {
+    fn spawn(display_name: &str, privileged: bool) -> io::Result<Self> {
+        let socket_path = dmabuf_socket_path();
+        let _ = fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path)?;
+        let mut command = if privileged {
+            let mut command = Command::new("pkexec");
+            command.arg("--disable-internal-agent");
+            command.arg(std::env::current_exe()?);
+            command
+        } else {
+            Command::new(std::env::current_exe()?)
+        };
+
+        log::info!(
+            "starting {} kms dmabuf helper stream for {}",
+            if privileged { "privileged" } else { "unprivileged" },
+            display_name
+        );
+
+        let mut child = command
+            .arg("--kms-helper")
+            .arg(if privileged {
+                "dmabuf-stream-privileged"
+            } else {
+                "dmabuf-stream"
+            })
+            .arg(display_name)
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let socket = accept_dmabuf_socket(&listener, &mut child, HELPER_READY_TIMEOUT)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "kms dmabuf helper stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "kms dmabuf helper stdout unavailable"))?;
+
+        let mut session = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            socket,
+            socket_path,
+        };
+        let mut ready = String::new();
+        session.wait_for_stdout(HELPER_READY_TIMEOUT, "kms dmabuf helper ready")?;
+        let read = session.stdout.read_line(&mut ready)?;
+        if read == 0 {
+            return Err(session.child_error("kms dmabuf helper exited before ready"));
+        }
+        if ready.trim() != "ready" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected kms dmabuf helper ready message: {}", ready.trim()),
+            ));
+        }
+        log::info!(
+            "{} kms dmabuf helper stream is ready for {}",
+            if privileged { "privileged" } else { "unprivileged" },
+            display_name
+        );
+        Ok(session)
+    }
+
+    fn frame(&mut self) -> io::Result<DmabufFrame> {
+        self.stdin.write_all(b"frame\n")?;
+        self.stdin.flush()?;
+        let (header, fds) = match recv_dmabuf_message(self.socket.as_raw_fd()) {
+            Ok(frame) => frame,
+            Err(err) => {
+                if self.wait_for_child_exit(Duration::from_millis(200)) {
+                    return Err(self.child_error("kms dmabuf helper exited before frame"));
+                }
+                return Err(err);
+            }
+        };
+        if header.planes.len() != fds.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "kms dmabuf plane/fd count mismatch: {} planes, {} fds",
+                    header.planes.len(),
+                    fds.len()
+                ),
+            ));
+        }
+        let planes = header
+            .planes
+            .into_iter()
+            .zip(fds)
+            .map(|(plane, fd)| DmabufPlane {
+                fd,
+                stride: plane.stride,
+                offset: plane.offset,
+            })
+            .collect();
+        Ok(DmabufFrame {
+            width: header.width,
+            height: header.height,
+            fourcc: header.fourcc,
+            modifier: header.modifier,
+            planes,
+        })
+    }
+
+    fn wait_for_stdout(&self, timeout: Duration, context: &str) -> io::Result<()> {
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = crate::libc::pollfd {
+            fd: self.stdout.get_ref().as_raw_fd(),
+            events: crate::libc::POLLIN | crate::libc::POLLHUP | crate::libc::POLLERR,
+            revents: 0,
+        };
+        let ret = unsafe { crate::libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{context} timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        if pollfd.revents & crate::libc::POLLERR != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("{context} pipe error"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn child_error(&mut self, fallback: &str) -> io::Error {
+        let mut stderr = String::new();
+        if let Some(stderr_pipe) = self.child.stderr.as_mut() {
+            let _ = stderr_pipe.read_to_string(&mut stderr);
+        }
+        let message = if stderr.trim().is_empty() {
+            fallback.to_owned()
+        } else {
+            stderr.trim().to_owned()
+        };
+        let kind = if should_retry_privileged_message(&message) {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::Other
+        };
+        io::Error::new(kind, message)
+    }
+
+    fn wait_for_child_exit(&mut self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+}
+
+impl Drop for HelperDmabufSession {
+    fn drop(&mut self) {
+        let _ = self.stdin.write_all(b"quit\n");
+        let _ = self.stdin.flush();
+        for _ in 0..10 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                let _ = fs::remove_file(&self.socket_path);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+fn dmabuf_socket_path() -> PathBuf {
+    let id = DMABUF_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "rustdesk-kms-dmabuf-{}-{id}.sock",
+        std::process::id()
+    ))
+}
+
+fn recv_dmabuf_message(socket_fd: RawFd) -> io::Result<(HelperDmabufHeader, Vec<OwnedFd>)> {
+    let mut data = vec![0_u8; 4096];
+    let mut iov = crate::libc::iovec {
+        iov_base: data.as_mut_ptr().cast::<crate::libc::c_void>(),
+        iov_len: data.len(),
+    };
+    let mut control = vec![0_u8; 256];
+    let mut msg = crate::libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: control.as_mut_ptr().cast::<crate::libc::c_void>(),
+        msg_controllen: control.len() as _,
+        msg_flags: 0,
+    };
+    let read = unsafe { crate::libc::recvmsg(socket_fd, &mut msg, 0) };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "kms dmabuf socket closed",
+        ));
+    }
+    data.truncate(read as usize);
+    if data.last() == Some(&b'\n') {
+        data.pop();
+    }
+    let header: HelperDmabufHeader = serde_json::from_slice(&data)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let fds = recv_fds_from_cmsg(&msg)?;
+    Ok((header, fds))
+}
+
+fn cmsg_align(len: usize) -> usize {
+    let align = std::mem::size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+fn recv_fds_from_cmsg(msg: &crate::libc::msghdr) -> io::Result<Vec<OwnedFd>> {
+    let mut fds = Vec::new();
+    if msg.msg_controllen < std::mem::size_of::<crate::libc::cmsghdr>() as _ {
+        return Ok(fds);
+    }
+    let cmsg = msg.msg_control.cast::<crate::libc::cmsghdr>();
+    unsafe {
+        if (*cmsg).cmsg_level != crate::libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != crate::libc::SCM_RIGHTS
+        {
+            return Ok(fds);
+        }
+        let header_len = cmsg_align(std::mem::size_of::<crate::libc::cmsghdr>());
+        let data_len = ((*cmsg).cmsg_len as usize).saturating_sub(header_len);
+        let fd_count = data_len / std::mem::size_of::<RawFd>();
+        let data = msg.msg_control.cast::<u8>().add(header_len).cast::<RawFd>();
+        for idx in 0..fd_count {
+            let fd = *data.add(idx);
+            fds.push(OwnedFd::from_raw_fd(fd));
+        }
+    }
+    Ok(fds)
+}
+
+fn accept_dmabuf_socket(
+    listener: &UnixListener,
+    child: &mut Child,
+    timeout: Duration,
+) -> io::Result<UnixStream> {
+    listener.set_nonblocking(true)?;
+    let started = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((socket, _)) => {
+                socket.set_nonblocking(false)?;
+                return Ok(socket);
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
+
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Err(child_error(child, "kms dmabuf helper exited before socket connect"));
+        }
+        if started.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "kms dmabuf helper socket connect timed out after {} ms",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn child_error(child: &mut Child, fallback: &str) -> io::Error {
+    let mut stderr = String::new();
+    if let Some(stderr_pipe) = child.stderr.as_mut() {
+        let _ = stderr_pipe.read_to_string(&mut stderr);
+    }
+    let message = if stderr.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        stderr.trim().to_owned()
+    };
+    let kind = if should_retry_privileged_message(&message) {
+        io::ErrorKind::PermissionDenied
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, message)
 }
