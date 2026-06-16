@@ -4,122 +4,80 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import '../common.dart';
+/// Font family name registered with [FontLoader] when a system CJK font is
+/// successfully loaded on ARM64 Linux.
+const kLinuxCjkFontFamily = 'SystemCJK';
 
-const _kCjkFontFamily = 'SystemCJK';
-
-// Well-known paths for CJK fonts on common Linux distributions.
-// Used as a fallback when fc-list is unavailable.
-const _kCjkFontSearchPaths = [
-  // Debian / Ubuntu — noto-fonts package
+const _kFontSearchPaths = [
+  // Debian / Ubuntu (noto-fonts / fonts-noto-cjk)
   '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
   '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
-  // Ubuntu split packages (noto-fonts-cjk)
   '/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf',
-  '/usr/share/fonts/opentype/noto/NotoSansCJKtc-Regular.otf',
-  '/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf',
-  '/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf',
-  // Fedora / RHEL / Rocky
+  // Fedora / RHEL / Rocky (google-noto-sans-cjk-fonts)
   '/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc',
   '/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc',
-  // Arch Linux
+  // Arch Linux (noto-fonts-cjk)
   '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
   '/usr/share/fonts/noto-cjk/NotoSansCJKsc-Regular.otf',
-  // Generic / others
+  // Generic fallback paths
   '/usr/share/fonts/noto/NotoSansCJK-Regular.ttc',
   '/usr/share/fonts/noto/NotoSansCJKsc-Regular.otf',
-  // WenQuanYi — often pre-installed on CJK distros
+  // WenQuanYi — commonly pre-installed on CJK-locale systems
   '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
   '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
   '/usr/share/fonts/wqy-microhei/wqy-microhei.ttc',
   '/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc',
 ];
 
-Future<bool> _isLinuxArm64() async {
+/// Loads a system CJK font on ARM64 Linux into Flutter's font registry via
+/// [FontLoader], working around the missing fontconfig support in the
+/// flutter-elinux engine (https://github.com/flutter/flutter/issues/139293).
+///
+/// Returns true if a CJK font was successfully loaded; false otherwise.
+/// On all other platforms this is a no-op and returns false immediately.
+Future<bool> loadSystemCJKFonts() async {
   if (!Platform.isLinux) return false;
   try {
-    final result = await Process.run('uname', ['-m']);
-    final arch = result.stdout.toString().trim();
-    return arch == 'aarch64' || arch == 'arm64';
+    final r = await Process.run('uname', ['-m']);
+    if (r.stdout.toString().trim() != 'aarch64') return false;
   } catch (_) {
+    return false;
+  }
+
+  final path = await _findCjkFontPath();
+  if (path == null) {
+    debugPrint('ARM64 Linux: no CJK font found; CJK text may not render');
+    return false;
+  }
+
+  try {
+    final loader = FontLoader(kLinuxCjkFontFamily);
+    final bytes = await File(path).readAsBytes();
+    loader.addFont(Future.value(ByteData.view(bytes.buffer)));
+    await loader.load();
+    debugPrint('ARM64 Linux: loaded CJK font from $path');
+    return true;
+  } catch (e) {
+    debugPrint('ARM64 Linux: failed to load CJK font: $e');
     return false;
   }
 }
 
-// Ask fontconfig (as a CLI tool) for a CJK font file. This works even
-// when the Flutter engine was built without --enable-fontconfig, because
-// fontconfig is a system library/tool independent of the engine.
-Future<String?> _findCjkFontViaFcList() async {
-  for (final lang in ['zh', 'zh-cn', 'zh-tw', 'ja', 'ko']) {
-    try {
-      final result = await Process.run(
-        'fc-list',
-        [':lang=$lang', '--format=%{file}\n'],
-      );
-      if (result.exitCode != 0) continue;
-      for (final line in result.stdout.toString().split('\n')) {
-        final path = line.trim();
-        if (path.isNotEmpty && File(path).existsSync()) {
-          return path;
-        }
-      }
-    } catch (_) {}
-  }
-  return null;
-}
-
 Future<String?> _findCjkFontPath() async {
-  final fcPath = await _findCjkFontViaFcList();
-  if (fcPath != null) return fcPath;
+  // fc-list is a fontconfig CLI tool available on most Linux systems
+  // independent of whether the Flutter engine was built with fontconfig.
+  try {
+    final r = await Process.run('fc-list', [':lang=zh', '--format=%{file}\n']);
+    if (r.exitCode == 0) {
+      for (final line in r.stdout.toString().split('\n')) {
+        final p = line.trim();
+        if (p.isNotEmpty && File(p).existsSync()) return p;
+      }
+    }
+  } catch (_) {}
 
-  for (final path in _kCjkFontSearchPaths) {
-    if (File(path).existsSync()) return path;
+  for (final p in _kFontSearchPaths) {
+    if (File(p).existsSync()) return p;
   }
   return null;
-}
-
-void _applyThemeFontFallback() {
-  final fallbacks = [_kCjkFontFamily];
-  MyTheme.lightTheme = MyTheme.lightTheme.copyWith(
-    textTheme: MyTheme.lightTheme.textTheme.apply(
-      fontFamilyFallback: fallbacks,
-    ),
-    primaryTextTheme: MyTheme.lightTheme.primaryTextTheme.apply(
-      fontFamilyFallback: fallbacks,
-    ),
-  );
-  MyTheme.darkTheme = MyTheme.darkTheme.copyWith(
-    textTheme: MyTheme.darkTheme.textTheme.apply(
-      fontFamilyFallback: fallbacks,
-    ),
-    primaryTextTheme: MyTheme.darkTheme.primaryTextTheme.apply(
-      fontFamilyFallback: fallbacks,
-    ),
-  );
-}
-
-/// On ARM64 Linux with flutter-elinux the engine is built without
-/// --enable-fontconfig, so the engine cannot discover system fonts.
-/// This function bypasses that limitation by loading a CJK font from
-/// a known filesystem path and registering it as a theme-level fallback
-/// so that CJK characters render correctly across the whole app.
-Future<void> loadSystemCJKFonts() async {
-  if (!await _isLinuxArm64()) return;
-
-  final fontPath = await _findCjkFontPath();
-  if (fontPath == null) {
-    debugPrint('ARM64 Linux: no CJK font found; CJK text may not render');
-    return;
-  }
-
-  try {
-    final loader = FontLoader(_kCjkFontFamily);
-    final bytes = await File(fontPath).readAsBytes();
-    loader.addFont(Future.value(ByteData.view(bytes.buffer)));
-    await loader.load();
-    debugPrint('ARM64 Linux: loaded CJK font from $fontPath');
-    _applyThemeFontFallback();
-  } catch (e) {
-    debugPrint('ARM64 Linux: failed to load CJK font: $e');
-  }
 }

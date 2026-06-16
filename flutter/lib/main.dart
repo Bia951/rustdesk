@@ -41,7 +41,9 @@ late List<String> kBootArgs;
 Future<void> main(List<String> args) async {
   earlyAssert();
   WidgetsFlutterBinding.ensureInitialized();
-  await loadSystemCJKFonts();
+  if (await loadSystemCJKFonts()) {
+    MyTheme.applyFontFallback([kLinuxCjkFontFamily]);
+  }
 
   debugPrint("launch args: $args");
   kBootArgs = List.from(args);
@@ -384,6 +386,7 @@ void _runApp(
       builder: (context, child) {
         child = _keepScaleBuilder(context, child);
         child = botToastBuilder(context, child);
+        child = _mergeCjkFallback(context, child);
         return child;
       },
     ),
@@ -534,6 +537,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
               : (context, child) {
                   child = _keepScaleBuilder(context, child);
                   child = botToastBuilder(context, child);
+                  child = _mergeCjkFallback(context, child);
                   if ((isDesktop && desktopType == DesktopType.main) ||
                       isWebDesktop) {
                     child = keyListenerBuilder(context, child);
@@ -577,6 +581,19 @@ _registerEventHandler() {
       NativeUiHandler.instance.onEvent(evt);
     });
   }
+}
+
+/// Merges the theme's fontFamilyFallback into [DefaultTextStyle] so that
+/// bare [Text] widgets (and those with inherit:true styles) also pick up the
+/// CJK fallback font loaded on ARM64 Linux.
+Widget? _mergeCjkFallback(BuildContext context, Widget? child) {
+  final fallback =
+      Theme.of(context).textTheme.bodyMedium?.fontFamilyFallback;
+  if (fallback == null || fallback.isEmpty) return child;
+  return DefaultTextStyle.merge(
+    style: TextStyle(fontFamilyFallback: fallback),
+    child: child ?? Container(),
+  );
 }
 
 Widget keyListenerBuilder(BuildContext context, Widget? child) {
