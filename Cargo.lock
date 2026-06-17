@@ -3974,11 +3974,12 @@ checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 [[package]]
 name = "hwcodec"
 version = "0.7.1"
-source = "git+https://github.com/rustdesk-org/hwcodec#778df1f99597722473b29443bac22ae6c23946fe"
+source = "git+https://github.com/Bia951/hwcodec?rev=848c4da44bd76580da2d793136da42de3d657f76#848c4da44bd76580da2d793136da42de3d657f76"
 dependencies = [
  "bindgen 0.59.2",
  "cc",
  "log",
+ "pkg-config",
  "serde 1.0.228",
  "serde_derive",
  "serde_json 1.0.118",

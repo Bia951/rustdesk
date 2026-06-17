@@ -6,9 +6,9 @@ use hbb_common::{
     message_proto::{video_frame, Chroma, VideoFrame},
     ResultType,
 };
-use std::{ffi::c_void, slice};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::{ffi::c_void, slice};
 
 cfg_if! {
     if #[cfg(quartz)] {
@@ -369,6 +369,36 @@ pub fn is_linux_wayland_capture_backend() -> bool {
 #[inline]
 pub fn is_linux_kms_capture_backend() -> bool {
     linux_capture_backend() == LinuxCaptureBackend::Kms
+}
+
+#[cfg(x11)]
+#[inline]
+pub fn is_linux_kms_dmabuf_capture_requested() -> bool {
+    std::env::var("RUSTDESK_KMS_DMABUF")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "y" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(x11)]
+#[inline]
+pub fn is_linux_kms_dmabuf_capture_enabled() -> bool {
+    is_linux_kms_dmabuf_capture_requested()
+        && !LINUX_KMS_DMABUF_CAPTURE_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(x11)]
+static LINUX_KMS_DMABUF_CAPTURE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(x11)]
+#[inline]
+pub fn set_linux_kms_dmabuf_capture_disabled_for_process(disabled: bool) {
+    LINUX_KMS_DMABUF_CAPTURE_DISABLED.store(disabled, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(x11)]

@@ -53,6 +53,8 @@ pub enum EncoderCfg {
     AOM(AomEncoderConfig),
     #[cfg(feature = "hwcodec")]
     HWRAM(HwRamEncoderConfig),
+    #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+    HWDMABUF(HwDmabufEncoderConfig),
     #[cfg(feature = "vram")]
     VRAM(VRamEncoderConfig),
 }
@@ -148,6 +150,19 @@ impl Encoder {
                 }),
                 Err(e) => {
                     log::error!("new hw encoder failed: {e:?}, clear config");
+                    HwCodecConfig::clear(false, true);
+                    *ENCODE_CODEC_FORMAT.lock().unwrap() = CodecFormat::VP9;
+                    Err(e)
+                }
+            },
+            #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+            EncoderCfg::HWDMABUF(_) => match HwDmabufEncoder::new(config, i444) {
+                Ok(hw) => Ok(Encoder {
+                    codec: Box::new(hw),
+                }),
+                Err(e) => {
+                    log::error!("new dmabuf hw encoder failed: {e:?}, clear config");
+                    crate::set_linux_kms_dmabuf_capture_disabled_for_process(true);
                     HwCodecConfig::clear(false, true);
                     *ENCODE_CODEC_FORMAT.lock().unwrap() = CodecFormat::VP9;
                     Err(e)
@@ -380,6 +395,21 @@ impl Encoder {
                     CodecFormat::H265
                 }
             }
+            #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+            EncoderCfg::HWDMABUF(hw) => {
+                let name = hw.name.to_lowercase();
+                if name.contains("vp8") {
+                    CodecFormat::VP8
+                } else if name.contains("vp9") {
+                    CodecFormat::VP9
+                } else if name.contains("av1") {
+                    CodecFormat::AV1
+                } else if name.contains("h264") {
+                    CodecFormat::H264
+                } else {
+                    CodecFormat::H265
+                }
+            }
             #[cfg(feature = "vram")]
             EncoderCfg::VRAM(vram) => match vram.feature.data_format {
                 hwcodec::common::DataFormat::H264 => CodecFormat::H264,
@@ -413,6 +443,8 @@ impl Encoder {
             EncoderCfg::AOM(_) => decodings.iter().all(|d| d.1.i444.av1),
             #[cfg(feature = "hwcodec")]
             EncoderCfg::HWRAM(_) => false,
+            #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+            EncoderCfg::HWDMABUF(_) => false,
             #[cfg(feature = "vram")]
             EncoderCfg::VRAM(_) => false,
         };

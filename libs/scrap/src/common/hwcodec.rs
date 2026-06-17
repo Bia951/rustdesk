@@ -11,6 +11,10 @@ use hbb_common::{
     serde_derive::{Deserialize, Serialize},
     serde_json, ResultType,
 };
+#[cfg(target_os = "linux")]
+use hwcodec::ffmpeg_ram::encode::{
+    DmabufFrame as HwcodecDmabufFrame, DmabufPlane as HwcodecDmabufPlane,
+};
 use hwcodec::{
     common::{
         DataFormat, HwcodecErrno,
@@ -24,12 +28,16 @@ use hwcodec::{
         ffmpeg_linesize_offset_length, CodecInfo,
     },
 };
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
 pub const DEFAULT_FPS: i32 = 30;
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
 pub const ERR_HEVC_POC: i32 = HwcodecErrno::HWCODEC_ERR_HEVC_COULD_NOT_FIND_POC as i32;
+#[cfg(target_os = "linux")]
+pub const HAS_AVFILTER: bool = hwcodec::ffmpeg_ram::HAS_AVFILTER;
 
 crate::generate_call_macro!(call_yuv, false);
 
@@ -49,12 +57,32 @@ pub struct HwRamEncoderConfig {
     pub keyframe_interval: Option<usize>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct HwDmabufEncoderConfig {
+    pub name: String,
+    pub mc_name: Option<String>,
+    pub width: usize,
+    pub height: usize,
+    pub quality: f32,
+    pub keyframe_interval: Option<usize>,
+}
+
 pub struct HwRamEncoder {
     encoder: Encoder,
     pub format: DataFormat,
     pub pixfmt: AVPixelFormat,
     bitrate: u32, //kbs
     config: HwRamEncoderConfig,
+}
+
+#[cfg(target_os = "linux")]
+pub struct HwDmabufEncoder {
+    encoder: Encoder,
+    pub format: DataFormat,
+    pub pixfmt: AVPixelFormat,
+    bitrate: u32,
+    config: HwDmabufEncoderConfig,
 }
 
 impl EncoderApi for HwRamEncoder {
@@ -179,6 +207,213 @@ impl EncoderApi for HwRamEncoder {
         );
         if bitrate > 0 {
             bitrate = Self::check_bitrate_range(&self.config, bitrate);
+            self.encoder.set_bitrate(bitrate as _).ok();
+            self.bitrate = bitrate;
+        }
+        self.config.quality = ratio;
+        Ok(())
+    }
+
+    fn bitrate(&self) -> u32 {
+        self.bitrate
+    }
+
+    fn support_changing_quality(&self) -> bool {
+        ["vaapi"].iter().all(|&x| !self.config.name.contains(x))
+    }
+
+    fn latency_free(&self) -> bool {
+        ["mediacodec", "videotoolbox"]
+            .iter()
+            .all(|&x| !self.config.name.contains(x))
+    }
+
+    fn is_hardware(&self) -> bool {
+        true
+    }
+
+    fn disable(&self) {
+        HwCodecConfig::clear(false, true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl EncoderApi for HwDmabufEncoder {
+    fn new(cfg: EncoderCfg, _i444: bool) -> ResultType<Self>
+    where
+        Self: Sized,
+    {
+        match cfg {
+            EncoderCfg::HWDMABUF(config) => {
+                let rc = HwRamEncoder::rate_control(&HwRamEncoderConfig {
+                    name: config.name.clone(),
+                    mc_name: config.mc_name.clone(),
+                    width: config.width,
+                    height: config.height,
+                    quality: config.quality,
+                    keyframe_interval: config.keyframe_interval,
+                });
+                let ram_config = HwRamEncoderConfig {
+                    name: config.name.clone(),
+                    mc_name: config.mc_name.clone(),
+                    width: config.width,
+                    height: config.height,
+                    quality: config.quality,
+                    keyframe_interval: config.keyframe_interval,
+                };
+                let mut bitrate = HwRamEncoder::bitrate(
+                    &config.name,
+                    config.width,
+                    config.height,
+                    config.quality,
+                );
+                bitrate = HwRamEncoder::check_bitrate_range(&ram_config, bitrate);
+                let gop = config.keyframe_interval.unwrap_or(DEFAULT_GOP as _) as i32;
+                let ctx = EncodeContext {
+                    name: config.name.clone(),
+                    mc_name: config.mc_name.clone(),
+                    width: config.width as _,
+                    height: config.height as _,
+                    pixfmt: DEFAULT_PIXFMT,
+                    align: HW_STRIDE_ALIGN as _,
+                    kbs: bitrate as i32,
+                    fps: DEFAULT_FPS,
+                    gop,
+                    quality: DEFAULT_HW_QUALITY,
+                    rc,
+                    q: -1,
+                    thread_count: codec_thread_num(16) as _,
+                };
+                let format = match Encoder::format_from_name(config.name.clone()) {
+                    Ok(format) => format,
+                    Err(_) => {
+                        return Err(anyhow!(format!(
+                            "failed to get format from name:{}",
+                            config.name
+                        )))
+                    }
+                };
+                match Encoder::new(ctx.clone()) {
+                    Ok(encoder) => Ok(HwDmabufEncoder {
+                        encoder,
+                        format,
+                        pixfmt: ctx.pixfmt,
+                        bitrate,
+                        config,
+                    }),
+                    Err(_) => Err(anyhow!(
+                        "Failed to create dmabuf encoder: codec={}, size={}x{}",
+                        config.name,
+                        config.width,
+                        config.height
+                    )),
+                }
+            }
+            _ => Err(anyhow!("encoder type mismatch")),
+        }
+    }
+
+    fn encode_to_message(&mut self, input: EncodeInput, ms: i64) -> ResultType<VideoFrame> {
+        let frame = input.dmabuf()?;
+        let dmabuf = HwcodecDmabufFrame {
+            width: frame.width,
+            height: frame.height,
+            encode_width: self.config.width,
+            encode_height: self.config.height,
+            fourcc: frame.fourcc,
+            modifier: frame.modifier,
+            planes: frame
+                .planes
+                .iter()
+                .map(|plane| HwcodecDmabufPlane {
+                    fd: plane.fd.as_raw_fd(),
+                    stride: plane.stride,
+                    offset: plane.offset,
+                })
+                .collect(),
+        };
+
+        let mut vf = VideoFrame::new();
+        let mut frames = Vec::new();
+        let mut encoded_frames = Vec::new();
+        let encoded = self.encoder.encode_dmabuf(&dmabuf, ms).map_err(|err| {
+            crate::set_linux_kms_dmabuf_capture_disabled_for_process(true);
+            anyhow!("Failed to encode dmabuf: {err}")
+        })?;
+        encoded_frames.append(encoded);
+        for frame in encoded_frames {
+            frames.push(EncodedVideoFrame {
+                data: Bytes::from(frame.data),
+                pts: frame.pts,
+                key: frame.key == 1,
+                ..Default::default()
+            });
+        }
+        if frames.len() > 0 {
+            let frames = EncodedVideoFrames {
+                frames: frames.into(),
+                ..Default::default()
+            };
+            match self.format {
+                DataFormat::H264 => vf.set_h264s(frames),
+                DataFormat::H265 => vf.set_h265s(frames),
+                _ => bail!("unsupported format: {:?}", self.format),
+            }
+            Ok(vf)
+        } else {
+            Err(anyhow!("no valid frame"))
+        }
+    }
+
+    fn yuvfmt(&self) -> crate::EncodeYuvFormat {
+        let pixfmt = if self.pixfmt == AVPixelFormat::AV_PIX_FMT_NV12 {
+            Pixfmt::NV12
+        } else {
+            Pixfmt::I420
+        };
+        let stride = self
+            .encoder
+            .linesize
+            .clone()
+            .drain(..)
+            .map(|i| i as usize)
+            .collect();
+        crate::EncodeYuvFormat {
+            pixfmt,
+            w: self.encoder.ctx.width as _,
+            h: self.encoder.ctx.height as _,
+            stride,
+            u: self.encoder.offset[0] as _,
+            v: if pixfmt == Pixfmt::NV12 {
+                0
+            } else {
+                self.encoder.offset[1] as _
+            },
+        }
+    }
+
+    #[cfg(feature = "vram")]
+    fn input_texture(&self) -> bool {
+        false
+    }
+
+    fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
+        let ram_config = HwRamEncoderConfig {
+            name: self.config.name.clone(),
+            mc_name: self.config.mc_name.clone(),
+            width: self.config.width,
+            height: self.config.height,
+            quality: self.config.quality,
+            keyframe_interval: self.config.keyframe_interval,
+        };
+        let mut bitrate = HwRamEncoder::bitrate(
+            &self.config.name,
+            self.config.width,
+            self.config.height,
+            ratio,
+        );
+        if bitrate > 0 {
+            bitrate = HwRamEncoder::check_bitrate_range(&ram_config, bitrate);
             self.encoder.set_bitrate(bitrate as _).ok();
             self.bitrate = bitrate;
         }

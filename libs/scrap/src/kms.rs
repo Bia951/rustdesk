@@ -1,4 +1,7 @@
-use crate::{common::would_block_if_equal, DmabufFrame, DmabufPlane, Frame, PixelBuffer, Pixfmt, TraitCapturer};
+use crate::{
+    common::would_block_if_equal, is_linux_kms_dmabuf_capture_enabled, DmabufFrame, DmabufPlane,
+    Frame, PixelBuffer, Pixfmt, TraitCapturer,
+};
 use hbb_common::log;
 use serde::Deserialize;
 use std::{
@@ -15,7 +18,6 @@ use std::{
 
 const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const HELPER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-const OPTION_KMS_DMABUF: &str = "RUSTDESK_KMS_DMABUF";
 static DMABUF_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
@@ -379,9 +381,7 @@ impl CapturedFrame {
 }
 
 fn use_dmabuf_capture() -> bool {
-    std::env::var(OPTION_KMS_DMABUF)
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "y" | "yes"))
-        .unwrap_or(false)
+    is_linux_kms_dmabuf_capture_enabled()
 }
 
 fn read_trimmed(path: PathBuf) -> io::Result<String> {

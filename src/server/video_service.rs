@@ -38,6 +38,8 @@ use hbb_common::{
 };
 #[cfg(feature = "hwcodec")]
 use scrap::hwcodec::{HwRamEncoder, HwRamEncoderConfig};
+#[cfg(all(feature = "hwcodec", target_os = "linux"))]
+use scrap::hwcodec::HwDmabufEncoderConfig;
 #[cfg(feature = "vram")]
 use scrap::vram::{VRamEncoder, VRamEncoderConfig};
 #[cfg(not(windows))]
@@ -49,6 +51,8 @@ use scrap::{
     vpxcodec::{VpxEncoderConfig, VpxVideoCodecId},
     CodecFormat, Display, EncodeInput, Frame, TraitCapturer, TraitPixelBuffer,
 };
+#[cfg(all(feature = "hwcodec", target_os = "linux"))]
+use scrap::codec::EncoderApi;
 #[cfg(windows)]
 use std::sync::Once;
 use std::{
@@ -442,11 +446,95 @@ pub fn dump_capture_frame(display_idx: usize, path: &str, timeout_millis: u64) -
     }
 }
 
+#[cfg(all(feature = "hwcodec", target_os = "linux"))]
+pub fn test_encode_dmabuf_frame(display_idx: usize, timeout_millis: u64) -> String {
+    let test_begin = Instant::now();
+    let frame = loop {
+        let result: ResultType<scrap::DmabufFrame> = (|| {
+            let mut displays = Display::all()?;
+            if displays.len() <= display_idx {
+                bail!(
+                    "Failed to get display {}, the displays' count is {}",
+                    display_idx,
+                    displays.len()
+                );
+            }
+            let display = displays.remove(display_idx);
+            let mut capturer = create_capturer(0, display, display_idx, false)?;
+            match capturer.frame(Duration::from_millis(0))? {
+                Frame::Dmabuf(frame) => Ok(frame),
+                Frame::PixelBuffer(_) => bail!("expected dmabuf frame, got pixel buffer"),
+                Frame::Texture(_) => bail!("expected dmabuf frame, got texture"),
+            }
+        })();
+
+        match result {
+            Ok(frame) => break frame,
+            Err(err) => {
+                if test_begin.elapsed().as_millis() >= timeout_millis as _ {
+                    return format_error_chain(&err);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let result: ResultType<String> = (|| {
+        let (encode_width, encode_height) = even_encoder_size(frame.width, frame.height)?;
+        let mut encoder = scrap::hwcodec::HwDmabufEncoder::new(
+            EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
+                name: "h264_vaapi".to_owned(),
+                mc_name: None,
+                width: encode_width,
+                height: encode_height,
+                quality: 1.0,
+                keyframe_interval: None,
+            }),
+            false,
+        )?;
+        let mut video_frame = encoder.encode_to_message(EncodeInput::Dmabuf(&frame), 0)?;
+        let frames = video_frame.take_h264s().frames;
+        let bytes: usize = frames.iter().map(|frame| frame.data.len()).sum();
+        Ok(format!(
+            "ok h264-vaapi-dmabuf capture={}x{} encode={}x{} fourcc={} modifier={} planes={} frames={} bytes={}",
+            frame.width,
+            frame.height,
+            encode_width,
+            encode_height,
+            frame.fourcc,
+            frame.modifier,
+            frame.planes.len(),
+            frames.len(),
+            bytes
+        ))
+    })();
+
+    match result {
+        Ok(msg) => msg,
+        Err(err) => format_error_chain(&err),
+    }
+}
+
+#[cfg(not(all(feature = "hwcodec", target_os = "linux")))]
+pub fn test_encode_dmabuf_frame(_display_idx: usize, _timeout_millis: u64) -> String {
+    "dmabuf encode test requires Linux hwcodec build".to_owned()
+}
+
 fn format_error_chain(err: &AnyhowError) -> String {
     err.chain()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
+}
+
+#[cfg(all(feature = "hwcodec", target_os = "linux"))]
+fn even_encoder_size(width: usize, height: usize) -> ResultType<(usize, usize)> {
+    let width = width & !1;
+    let height = height & !1;
+    if width == 0 || height == 0 {
+        bail!("invalid dmabuf encoder size: {width}x{height}");
+    }
+    Ok((width, height))
 }
 
 // Note: This function is extremely expensive, do not call it frequently.
@@ -713,6 +801,10 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     let display_idx = vs.idx;
     let sp = vs.sp;
+    #[cfg(target_os = "linux")]
+    let kms_dmabuf_enabled_at_capture = vs.source.is_monitor()
+        && scrap::is_linux_kms_capture_backend()
+        && scrap::is_linux_kms_dmabuf_capture_enabled();
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
     #[cfg(target_os = "linux")]
     if vs.source.is_monitor()
@@ -749,6 +841,13 @@ fn run(vs: VideoService) -> ResultType<()> {
     ) {
         Ok(result) => result,
         Err(err) => {
+            #[cfg(target_os = "linux")]
+            if kms_dmabuf_enabled_at_capture && !scrap::is_linux_kms_dmabuf_capture_enabled() {
+                log::warn!(
+                    "Failed to create KMS dmabuf encoder: {err:?}; recreate capturer without dmabuf capture"
+                );
+                bail!("SWITCH");
+            }
             log::error!("Failed to create encoder: {err:?}, fallback to VP9");
             Encoder::set_fallback(&EncoderCfg::VPX(VpxEncoderConfig {
                 width: c.width as _,
@@ -769,6 +868,18 @@ fn run(vs: VideoService) -> ResultType<()> {
             )?
         }
     };
+    #[cfg(target_os = "linux")]
+    if kms_dmabuf_enabled_at_capture != scrap::is_linux_kms_dmabuf_capture_enabled() {
+        log::info!(
+            "switch to recreate KMS capturer {} dmabuf capture",
+            if scrap::is_linux_kms_dmabuf_capture_enabled() {
+                "with"
+            } else {
+                "without"
+            }
+        );
+        bail!("SWITCH");
+    }
     #[cfg(feature = "vram")]
     c.set_output_texture(encoder.input_texture());
     #[cfg(target_os = "android")]
@@ -1161,6 +1272,44 @@ fn get_encoder_config(
     let keyframe_interval = if record { Some(240) } else { None };
     #[cfg(target_os = "linux")]
     if _source.is_monitor() && scrap::is_linux_kms_capture_backend() {
+        if scrap::is_linux_kms_dmabuf_capture_requested() {
+            if scrap::is_linux_kms_dmabuf_capture_enabled() {
+                #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+                let negotiated_codec = Encoder::negotiated_codec();
+                #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+                if negotiated_codec == CodecFormat::H264 && scrap::hwcodec::HAS_AVFILTER {
+                    if let Some(hw) = HwRamEncoder::try_get(CodecFormat::H264) {
+                        if hw.name.contains("vaapi") {
+                            log::info!(
+                                "kms dmabuf capture backend uses VAAPI H264 dmabuf encoder"
+                            );
+                            return EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
+                                name: hw.name,
+                                mc_name: hw.mc_name,
+                                width: c.width & !1,
+                                height: c.height & !1,
+                                quality,
+                                keyframe_interval,
+                            });
+                        }
+                    }
+                }
+                #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+                if negotiated_codec == CodecFormat::H264 && !scrap::hwcodec::HAS_AVFILTER {
+                    log::warn!(
+                        "kms dmabuf capture backend requires libavfilter for VAAPI RGB conversion"
+                    );
+                }
+                log::info!(
+                    "kms dmabuf capture backend cannot use VAAPI H264, fallback to VP9 software encoder"
+                );
+                scrap::set_linux_kms_dmabuf_capture_disabled_for_process(true);
+            } else {
+                log::info!(
+                    "kms dmabuf capture backend is disabled for this process, fallback to VP9 software encoder"
+                );
+            }
+        }
         log::info!("kms capture backend uses VP9 software encoder for RAM frames");
         return EncoderCfg::VPX(VpxEncoderConfig {
             width: c.width as _,
@@ -1372,6 +1521,16 @@ fn handle_one_frame(
             }
         }
         Err(e) => {
+            #[cfg(target_os = "linux")]
+            if scrap::is_linux_kms_capture_backend()
+                && scrap::is_linux_kms_dmabuf_capture_requested()
+                && !scrap::is_linux_kms_dmabuf_capture_enabled()
+                && encoder.is_hardware()
+            {
+                encoder.disable();
+                log::error!("switch due to KMS dmabuf encoder failure: {e:?}");
+                bail!("SWITCH");
+            }
             *encode_fail_counter += 1;
             // Encoding errors are not frequent except on Android
             if !cfg!(target_os = "android") {
