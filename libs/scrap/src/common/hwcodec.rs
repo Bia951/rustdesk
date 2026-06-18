@@ -336,10 +336,19 @@ impl EncoderApi for HwDmabufEncoder {
         let mut vf = VideoFrame::new();
         let mut frames = Vec::new();
         let mut encoded_frames = Vec::new();
-        let encoded = self.encoder.encode_dmabuf(&dmabuf, ms).map_err(|err| {
-            crate::set_linux_kms_dmabuf_capture_disabled_for_process(true);
-            anyhow!("Failed to encode dmabuf: {err}")
-        })?;
+        let encoded = match self.encoder.encode_dmabuf(&dmabuf, ms) {
+            Ok(encoded) => {
+                crate::note_linux_kms_dmabuf_encode_result(true);
+                encoded
+            }
+            Err(err) => {
+                // Don't nuke the dmabuf path on a single failure; only give up
+                // after enough consecutive failures (tracked process-globally,
+                // since the caller recreates the encoder on each failure).
+                crate::note_linux_kms_dmabuf_encode_result(false);
+                bail!("Failed to encode dmabuf: {err}");
+            }
+        };
         encoded_frames.append(encoded);
         for frame in encoded_frames {
             frames.push(EncodedVideoFrame {

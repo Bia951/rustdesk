@@ -402,6 +402,32 @@ pub fn set_linux_kms_dmabuf_capture_disabled_for_process(disabled: bool) {
 }
 
 #[cfg(x11)]
+static LINUX_KMS_DMABUF_ENCODE_FAILS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+// Only give up on dmabuf capture for the whole process after this many
+// *consecutive* encode failures, so a transient error (or a warm-up frame that
+// produced no packet yet) does not permanently nuke the path. The counter is
+// process-global on purpose: the caller recreates the encoder on each failure,
+// so per-instance state would never accumulate. Any success resets it.
+#[cfg(x11)]
+const MAX_LINUX_KMS_DMABUF_ENCODE_FAILS: u32 = 10;
+
+#[cfg(x11)]
+pub fn note_linux_kms_dmabuf_encode_result(success: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if success {
+        LINUX_KMS_DMABUF_ENCODE_FAILS.store(0, SeqCst);
+        return;
+    }
+    let fails = LINUX_KMS_DMABUF_ENCODE_FAILS.fetch_add(1, SeqCst) + 1;
+    if fails >= MAX_LINUX_KMS_DMABUF_ENCODE_FAILS {
+        log::error!("disabling KMS dmabuf capture after {fails} consecutive encode failures");
+        set_linux_kms_dmabuf_capture_disabled_for_process(true);
+    }
+}
+
+#[cfg(x11)]
 #[inline]
 pub fn is_cursor_embedded() -> bool {
     linux_capture_backend() == LinuxCaptureBackend::X11 && x11::IS_CURSOR_EMBEDDED
