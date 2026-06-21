@@ -36,6 +36,9 @@ struct ProbeDisplay {
     name: String,
     width: usize,
     height: usize,
+    // false when the active scanout buffer uses a tiled/compressed modifier the
+    // CPU readback path cannot decode; such displays must use the dmabuf path.
+    is_linear: bool,
     online: bool,
     can_open: bool,
     open_error: Option<String>,
@@ -227,7 +230,8 @@ fn frame(display_name: &str, privileged: bool) -> ResultType<FrameCapture> {
     }
 
     let card = Card(open_card(Path::new(&display.card_path))?);
-    match capture_frame(&card, &display, privileged) {
+    configure_card(&card);
+    match capture_frame(&card, &display) {
         Ok(frame) => Ok(frame),
         Err(err) if !privileged && should_retry_privileged(&err) => {
             retry_privileged_frame(display_name)
@@ -250,6 +254,7 @@ fn stream(display_name: &str, privileged: bool) -> ResultType<()> {
     }
 
     let card = Card(open_card(Path::new(&display.card_path))?);
+    configure_card(&card);
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -267,7 +272,7 @@ fn stream(display_name: &str, privileged: bool) -> ResultType<()> {
             break;
         }
         match line.trim() {
-            "frame" => write_frame(&capture_frame(&card, &display, privileged)?)?,
+            "frame" => write_frame(&capture_frame(&card, &display)?)?,
             "quit" => break,
             "" => {}
             cmd => bail!("unsupported kms helper stream command: {cmd}"),
@@ -290,6 +295,7 @@ fn stream_dmabuf(display_name: &str, socket_path: &str, privileged: bool) -> Res
     }
 
     let card = Card(open_card(Path::new(&display.card_path))?);
+    configure_card(&card);
     let socket = UnixStream::connect(socket_path)
         .with_context(|| format!("failed to connect kms dmabuf socket {socket_path}"))?;
 
@@ -309,7 +315,7 @@ fn stream_dmabuf(display_name: &str, socket_path: &str, privileged: bool) -> Res
             break;
         }
         match line.trim() {
-            "frame" => write_dmabuf_frame(&socket, &capture_dmabuf_frame(&card, &display, privileged)?)?,
+            "frame" => write_dmabuf_frame(&socket, &capture_dmabuf_frame(&card, &display)?)?,
             "quit" => break,
             "" => {}
             cmd => bail!("unsupported kms helper dmabuf stream command: {cmd}"),
@@ -342,15 +348,17 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
         .context("invalid drm connector name")?;
     let card_path = PathBuf::from("/dev/dri").join(card_name);
     let (can_open, open_error) = check_card_access(&card_path);
+    let mut is_linear = true;
     if can_open {
         if let Ok(card) = open_card(&card_path) {
             let card = Card(card);
-            configure_card(&card, false);
-            if let Ok((active_width, active_height)) =
-                active_framebuffer_size(&card, name, width, height)
+            configure_card(&card);
+            if let Ok((active_width, active_height, active_is_linear)) =
+                active_framebuffer_info(&card, name, width, height)
             {
                 width = active_width;
                 height = active_height;
+                is_linear = active_is_linear;
             }
         }
     }
@@ -361,6 +369,7 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
         name: name.to_owned(),
         width,
         height,
+        is_linear,
         online: true,
         can_open,
         open_error,
@@ -382,12 +391,12 @@ fn find_display(display_name: &str) -> ResultType<ProbeDisplay> {
     bail!("kms display '{display_name}' not found");
 }
 
-fn active_framebuffer_size(
+fn active_framebuffer_info(
     card: &Card,
     display_name: &str,
     fallback_width: usize,
     fallback_height: usize,
-) -> ResultType<(usize, usize)> {
+) -> ResultType<(usize, usize, bool)> {
     let connector_name = display_name
         .split_once('-')
         .map(|(_, name)| name)
@@ -415,19 +424,15 @@ fn active_framebuffer_size(
         .context("crtc has no active framebuffer")?;
     let info = card.get_framebuffer(framebuffer)?;
     let size = info.size();
-    Ok((size.0 as usize, size.1 as usize))
+    let is_linear = framebuffer_is_linear(card, framebuffer);
+    Ok((size.0 as usize, size.1 as usize, is_linear))
 }
 
 fn open_card(card_path: &Path) -> io::Result<std::fs::File> {
     OpenOptions::new().read(true).write(true).open(card_path)
 }
 
-fn capture_frame(
-    card: &Card,
-    display: &ProbeDisplay,
-    privileged: bool,
-) -> ResultType<FrameCapture> {
-    configure_card(card, privileged);
+fn capture_frame(card: &Card, display: &ProbeDisplay) -> ResultType<FrameCapture> {
     let connector_name = display
         .name
         .split_once('-')
@@ -478,12 +483,7 @@ fn capture_frame(
     bail!("crtc has no active framebuffer")
 }
 
-fn capture_dmabuf_frame(
-    card: &Card,
-    display: &ProbeDisplay,
-    privileged: bool,
-) -> ResultType<DmabufFrameCapture> {
-    configure_card(card, privileged);
+fn capture_dmabuf_frame(card: &Card, display: &ProbeDisplay) -> ResultType<DmabufFrameCapture> {
     let connector_name = display
         .name
         .split_once('-')
@@ -646,11 +646,14 @@ fn capture_framebuffer_dmabuf(
     })
 }
 
-fn configure_card(card: &Card, privileged: bool) {
+// Only enable universal planes here: this call does not need DRM master and is
+// safe on a non-master fd. Never call drmSetMaster: the privileged/pkexec path
+// runs as root, where CAP_SYS_ADMIN already lets drmModeGetFB2 return a usable
+// GEM handle without master. Grabbing master would race an active compositor —
+// during a VT-switch/handover window it could steal master and leave the
+// desktop session unable to modeset, blanking the screen.
+fn configure_card(card: &Card) {
     let _ = card.set_client_capability(ClientCapability::UniversalPlanes, true);
-    if privileged {
-        let _ = card.acquire_master_lock();
-    }
 }
 
 fn should_retry_privileged(err: &hbb_common::anyhow::Error) -> bool {
@@ -852,14 +855,37 @@ fn resolve_connector(
 fn validate_modifier(modifier: Option<drm::buffer::DrmModifier>) -> ResultType<()> {
     if let Some(modifier) = modifier {
         if modifier != drm::buffer::DrmModifier::Linear {
+            // The CPU readback path mmaps the scanout buffer as a linear array.
+            // Tiled/compressed modifiers (the default on modern Intel/AMD) would
+            // decode to garbage, so reject them with a typed, actionable error.
+            // The GPU dmabuf/VAAPI path understands tiling and should be used
+            // instead. ErrorKind::Unsupported on purpose: it must not be mistaken
+            // for a permission error and trigger a pointless pkexec retry.
             return Err(io::Error::new(
                 ErrorKind::Unsupported,
-                format!("unsupported framebuffer modifier: {modifier:?}"),
+                format!(
+                    "non-linear framebuffer modifier {modifier:?}; the CPU/KMS readback path \
+                     requires a linear buffer — use the dmabuf/VAAPI capture path"
+                ),
             )
             .into());
         }
     }
     Ok(())
+}
+
+fn framebuffer_is_linear(card: &Card, framebuffer: control::framebuffer::Handle) -> bool {
+    // drmModeGetFB2 reports the format modifier without needing DRM master, so
+    // even an unprivileged probe can tell tiled buffers from linear ones. If the
+    // modifier can't be determined, assume linear so we don't force the dmabuf
+    // path onto buffers the CPU readback could have handled.
+    match card.get_planar_framebuffer(framebuffer) {
+        Ok(planar) => matches!(
+            planar.modifier(),
+            None | Some(drm::buffer::DrmModifier::Linear)
+        ),
+        Err(_) => true,
+    }
 }
 
 fn map_drm_fourcc(format: DrmFourcc) -> ResultType<&'static str> {

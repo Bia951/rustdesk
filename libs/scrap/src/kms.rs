@@ -1,6 +1,6 @@
 use crate::{
-    common::would_block_if_equal, is_linux_kms_dmabuf_capture_enabled, DmabufFrame, DmabufPlane,
-    Frame, PixelBuffer, Pixfmt, TraitCapturer,
+    common::would_block_if_equal, is_linux_kms_dmabuf_capture_enabled_for, DmabufFrame,
+    DmabufPlane, Frame, PixelBuffer, Pixfmt, TraitCapturer,
 };
 use hbb_common::log;
 use serde::Deserialize;
@@ -31,6 +31,9 @@ pub struct Display {
     online: bool,
     primary: bool,
     accessible: bool,
+    // false when the active scanout buffer is tiled/non-linear, so the CPU
+    // readback path can't decode it and the dmabuf path is required.
+    is_linear: bool,
 }
 
 impl Display {
@@ -97,6 +100,10 @@ impl Display {
         &self.connector_path
     }
 
+    pub fn is_linear(&self) -> bool {
+        self.is_linear
+    }
+
     fn from_helper_display(display: HelperDisplay) -> Self {
         Self {
             card_path: PathBuf::from(display.card_path),
@@ -108,6 +115,7 @@ impl Display {
             online: display.online,
             primary: false,
             accessible: display.can_open,
+            is_linear: display.is_linear,
         }
     }
 
@@ -147,6 +155,9 @@ impl Display {
             online: true,
             primary: false,
             accessible,
+            // The sysfs fallback can't read the framebuffer modifier; assume
+            // linear so we don't force the dmabuf path on an unverified buffer.
+            is_linear: true,
         }))
     }
 }
@@ -173,6 +184,7 @@ impl Capturer {
                 format!("DRM device '{}' not found", display.card_path().display()),
             ));
         }
+        let use_dmabuf = is_linux_kms_dmabuf_capture_enabled_for(display.is_linear());
         let mut capturer = Capturer {
             width: display.width(),
             height: display.height(),
@@ -184,7 +196,7 @@ impl Capturer {
             dmabuf_helper: None,
             pending_frame: None,
             privileged_attempted: false,
-            use_dmabuf: use_dmabuf_capture(),
+            use_dmabuf,
         };
         capturer.prime_frame()?;
         Ok(capturer)
@@ -196,6 +208,10 @@ impl Capturer {
 
     pub fn height(&self) -> usize {
         self.height
+    }
+
+    pub fn produces_dmabuf(&self) -> bool {
+        self.use_dmabuf
     }
 }
 
@@ -266,6 +282,20 @@ impl Capturer {
         if self.use_dmabuf {
             self.read_helper_dmabuf_frame().map(CapturedFrame::Dmabuf)
         } else {
+            if !self.display.is_linear() {
+                // Tiled scanout buffer + CPU readback would yield garbage, and we
+                // didn't enable dmabuf (VAAPI unavailable). Fail with a clear,
+                // actionable error instead of spawning a doomed helper.
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "kms display '{}' uses a tiled/non-linear framebuffer the CPU capture \
+                         path cannot read; the VAAPI dmabuf path is required but unavailable \
+                         (needs hwcodec built with libavfilter and a VAAPI H264 encoder)",
+                        self.display.name()
+                    ),
+                ));
+            }
             self.read_helper_frame().map(CapturedFrame::Pixel)
         }
     }
@@ -380,10 +410,6 @@ impl CapturedFrame {
     }
 }
 
-fn use_dmabuf_capture() -> bool {
-    is_linux_kms_dmabuf_capture_enabled()
-}
-
 fn read_trimmed(path: PathBuf) -> io::Result<String> {
     Ok(fs::read_to_string(path)?.trim().to_owned())
 }
@@ -476,8 +502,15 @@ struct HelperDisplay {
     name: String,
     width: usize,
     height: usize,
+    // Defaulted for forward compatibility; assume linear (CPU path) if absent.
+    #[serde(default = "helper_display_default_is_linear")]
+    is_linear: bool,
     online: bool,
     can_open: bool,
+}
+
+fn helper_display_default_is_linear() -> bool {
+    true
 }
 
 #[derive(Deserialize)]

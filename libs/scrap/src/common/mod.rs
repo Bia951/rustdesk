@@ -143,6 +143,13 @@ pub trait TraitCapturer {
         None
     }
 
+    // Linux KMS only: whether this capturer emits dmabuf frames that must be
+    // encoded through the VAAPI dmabuf path. Every other backend/platform
+    // produces pixel buffers, so the default is false.
+    fn produces_dmabuf(&self) -> bool {
+        false
+    }
+
     #[cfg(windows)]
     fn is_gdi(&self) -> bool;
     #[cfg(windows)]
@@ -399,6 +406,54 @@ static LINUX_KMS_DMABUF_CAPTURE_DISABLED: std::sync::atomic::AtomicBool =
 #[inline]
 pub fn set_linux_kms_dmabuf_capture_disabled_for_process(disabled: bool) {
     LINUX_KMS_DMABUF_CAPTURE_DISABLED.store(disabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(x11)]
+#[inline]
+pub fn is_linux_kms_dmabuf_capture_disabled_for_process() -> bool {
+    LINUX_KMS_DMABUF_CAPTURE_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// Whether the VAAPI dmabuf encode path is actually usable right now: hwcodec
+// must be built with libavfilter (needed for the scanout RGB -> NV12 conversion),
+// a VAAPI H264 encoder must be present, and H264 must be the negotiated codec.
+// H265 VAAPI dmabuf encoding is not wired up yet.
+#[cfg(x11)]
+pub fn linux_kms_dmabuf_vaapi_available() -> bool {
+    #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+    {
+        if !crate::hwcodec::HAS_AVFILTER {
+            return false;
+        }
+        if crate::codec::Encoder::negotiated_codec() != CodecFormat::H264 {
+            return false;
+        }
+        crate::hwcodec::HwRamEncoder::try_get(CodecFormat::H264)
+            .map(|hw| hw.name.contains("vaapi"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(all(feature = "hwcodec", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+// Per-display dmabuf decision. dmabuf frames are only consumable by the VAAPI
+// dmabuf encoder, so the path is enabled only when that encoder is available and
+// either the user opted in via env or the display's scanout buffer is
+// tiled/non-linear (which the CPU readback path can't decode). The process-global
+// disable flag (set after repeated encode failures) overrides everything. Both
+// the capturer and the encoder selection read this, so they stay consistent.
+#[cfg(x11)]
+#[inline]
+pub fn is_linux_kms_dmabuf_capture_enabled_for(is_linear: bool) -> bool {
+    if is_linux_kms_dmabuf_capture_disabled_for_process() {
+        return false;
+    }
+    if !linux_kms_dmabuf_vaapi_available() {
+        return false;
+    }
+    is_linux_kms_dmabuf_capture_requested() || !is_linear
 }
 
 #[cfg(x11)]

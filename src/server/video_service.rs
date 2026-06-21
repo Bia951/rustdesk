@@ -801,11 +801,15 @@ fn run(vs: VideoService) -> ResultType<()> {
 
     let display_idx = vs.idx;
     let sp = vs.sp;
+    let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+    // The capturer is the source of truth for whether dmabuf frames are produced
+    // (explicit opt-in or auto-selected for a tiled display). The encoder choice
+    // below must match it; a later flip of the process-global disable flag
+    // triggers a recreate.
     #[cfg(target_os = "linux")]
     let kms_dmabuf_enabled_at_capture = vs.source.is_monitor()
         && scrap::is_linux_kms_capture_backend()
-        && scrap::is_linux_kms_dmabuf_capture_enabled();
-    let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
+        && c.produces_dmabuf();
     #[cfg(target_os = "linux")]
     if vs.source.is_monitor()
         && scrap::is_linux_kms_capture_backend()
@@ -842,7 +846,9 @@ fn run(vs: VideoService) -> ResultType<()> {
         Ok(result) => result,
         Err(err) => {
             #[cfg(target_os = "linux")]
-            if kms_dmabuf_enabled_at_capture && !scrap::is_linux_kms_dmabuf_capture_enabled() {
+            if kms_dmabuf_enabled_at_capture
+                && scrap::is_linux_kms_dmabuf_capture_disabled_for_process()
+            {
                 log::warn!(
                     "Failed to create KMS dmabuf encoder: {err:?}; recreate capturer without dmabuf capture"
                 );
@@ -869,15 +875,8 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
     };
     #[cfg(target_os = "linux")]
-    if kms_dmabuf_enabled_at_capture != scrap::is_linux_kms_dmabuf_capture_enabled() {
-        log::info!(
-            "switch to recreate KMS capturer {} dmabuf capture",
-            if scrap::is_linux_kms_dmabuf_capture_enabled() {
-                "with"
-            } else {
-                "without"
-            }
-        );
+    if kms_dmabuf_enabled_at_capture && scrap::is_linux_kms_dmabuf_capture_disabled_for_process() {
+        log::info!("recreate KMS capturer without dmabuf capture after it was disabled");
         bail!("SWITCH");
     }
     #[cfg(feature = "vram")]
@@ -1272,43 +1271,32 @@ fn get_encoder_config(
     let keyframe_interval = if record { Some(240) } else { None };
     #[cfg(target_os = "linux")]
     if _source.is_monitor() && scrap::is_linux_kms_capture_backend() {
-        if scrap::is_linux_kms_dmabuf_capture_requested() {
-            if scrap::is_linux_kms_dmabuf_capture_enabled() {
-                #[cfg(all(feature = "hwcodec", target_os = "linux"))]
-                let negotiated_codec = Encoder::negotiated_codec();
-                #[cfg(all(feature = "hwcodec", target_os = "linux"))]
-                if negotiated_codec == CodecFormat::H264 && scrap::hwcodec::HAS_AVFILTER {
-                    if let Some(hw) = HwRamEncoder::try_get(CodecFormat::H264) {
-                        if hw.name.contains("vaapi") {
-                            log::info!(
-                                "kms dmabuf capture backend uses VAAPI H264 dmabuf encoder"
-                            );
-                            return EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
-                                name: hw.name,
-                                mc_name: hw.mc_name,
-                                width: c.width & !1,
-                                height: c.height & !1,
-                                quality,
-                                keyframe_interval,
-                            });
-                        }
-                    }
+        // The capturer already decided whether to emit dmabuf frames (explicit
+        // opt-in or auto-selected for a tiled display), and only does so when a
+        // VAAPI H264 encoder is available. Mirror that decision here so capture
+        // and encode stay in lockstep.
+        #[cfg(all(feature = "hwcodec", target_os = "linux"))]
+        if c.produces_dmabuf() {
+            if let Some(hw) = HwRamEncoder::try_get(CodecFormat::H264) {
+                if hw.name.contains("vaapi") {
+                    log::info!("kms dmabuf capture backend uses VAAPI H264 dmabuf encoder");
+                    return EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
+                        name: hw.name,
+                        mc_name: hw.mc_name,
+                        width: c.width & !1,
+                        height: c.height & !1,
+                        quality,
+                        keyframe_interval,
+                    });
                 }
-                #[cfg(all(feature = "hwcodec", target_os = "linux"))]
-                if negotiated_codec == CodecFormat::H264 && !scrap::hwcodec::HAS_AVFILTER {
-                    log::warn!(
-                        "kms dmabuf capture backend requires libavfilter for VAAPI RGB conversion"
-                    );
-                }
-                log::info!(
-                    "kms dmabuf capture backend cannot use VAAPI H264, fallback to VP9 software encoder"
-                );
-                scrap::set_linux_kms_dmabuf_capture_disabled_for_process(true);
-            } else {
-                log::info!(
-                    "kms dmabuf capture backend is disabled for this process, fallback to VP9 software encoder"
-                );
             }
+            // The VAAPI encoder is gone since capture started (e.g. disabled
+            // after earlier failures). Give up on dmabuf so the capturer is
+            // recreated for the CPU path on the next SWITCH.
+            log::warn!(
+                "kms dmabuf capture active but no VAAPI H264 encoder available; disabling dmabuf"
+            );
+            scrap::set_linux_kms_dmabuf_capture_disabled_for_process(true);
         }
         log::info!("kms capture backend uses VP9 software encoder for RAM frames");
         return EncoderCfg::VPX(VpxEncoderConfig {

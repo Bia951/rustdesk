@@ -56,6 +56,13 @@ impl TraitCapturer for Capturer {
     fn capturer_height(&self) -> Option<usize> {
         Some(self.height())
     }
+
+    fn produces_dmabuf(&self) -> bool {
+        match self {
+            Capturer::KMS(d) => d.produces_dmabuf(),
+            _ => false,
+        }
+    }
 }
 
 pub enum Display {
