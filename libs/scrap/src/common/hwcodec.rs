@@ -162,7 +162,7 @@ impl EncoderApi for HwRamEncoder {
             }
             Ok(vf)
         } else {
-            Err(anyhow!("no valid frame"))
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
         }
     }
 
@@ -370,7 +370,7 @@ impl EncoderApi for HwDmabufEncoder {
             }
             Ok(vf)
         } else {
-            Err(anyhow!("no valid frame"))
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
         }
     }
 
@@ -439,7 +439,7 @@ impl EncoderApi for HwDmabufEncoder {
     }
 
     fn latency_free(&self) -> bool {
-        ["mediacodec", "videotoolbox"]
+        ["mediacodec", "videotoolbox", "vaapi"]
             .iter()
             .all(|&x| !self.config.name.contains(x))
     }
@@ -473,6 +473,20 @@ impl HwRamEncoder {
         info
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn try_get_vaapi(format: CodecFormat) -> Option<CodecInfo> {
+        let format = match format {
+            CodecFormat::H264 => DataFormat::H264,
+            CodecFormat::H265 => DataFormat::H265,
+            _ => return None,
+        };
+        HwCodecConfig::get()
+            .ram_encode
+            .into_iter()
+            .filter(|codec| codec.format == format && codec.name.contains("vaapi"))
+            .min_by_key(|codec| codec.priority)
+    }
+
     pub fn encode(&mut self, yuv: &[u8], ms: i64) -> ResultType<Vec<EncodeFrame>> {
         match self.encoder.encode(yuv, ms) {
             Ok(v) => {
@@ -480,7 +494,7 @@ impl HwRamEncoder {
                 data.append(v);
                 Ok(data)
             }
-            Err(_) => Ok(Vec::<EncodeFrame>::new()),
+            Err(err) => Err(anyhow!("hardware encoder failed: {err}")),
         }
     }
 

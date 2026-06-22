@@ -1062,7 +1062,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     }
 
                     let frame = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                    let send_conn_ids = handle_one_frame(
+                    if let Some(send_conn_ids) = handle_one_frame(
                         display_idx,
                         &sp,
                         frame,
@@ -1073,9 +1073,10 @@ fn run(vs: VideoService) -> ResultType<()> {
                         &mut first_frame,
                         capture_width,
                         capture_height,
-                    )?;
-                    frame_controller.set_send(now, send_conn_ids);
-                    send_counter += 1;
+                    )? {
+                        frame_controller.set_send(now, send_conn_ids);
+                        send_counter += 1;
+                    }
                 }
                 #[cfg(windows)]
                 {
@@ -1121,7 +1122,7 @@ fn run(vs: VideoService) -> ResultType<()> {
                     // yun.len() > 0 means the frame is not texture.
                     if repeat_encode_counter < repeat_encode_max {
                         repeat_encode_counter += 1;
-                        let send_conn_ids = handle_one_frame(
+                        if let Some(send_conn_ids) = handle_one_frame(
                             display_idx,
                             &sp,
                             EncodeInput::YUV(&yuv),
@@ -1132,9 +1133,10 @@ fn run(vs: VideoService) -> ResultType<()> {
                             &mut first_frame,
                             capture_width,
                             capture_height,
-                        )?;
-                        frame_controller.set_send(now, send_conn_ids);
-                        send_counter += 1;
+                        )? {
+                            frame_controller.set_send(now, send_conn_ids);
+                            send_counter += 1;
+                        }
                     }
                 }
             }
@@ -1273,28 +1275,27 @@ fn get_encoder_config(
     if _source.is_monitor() && scrap::is_linux_kms_capture_backend() {
         // The capturer already decided whether to emit dmabuf frames (explicit
         // opt-in or auto-selected for a tiled display), and only does so when a
-        // VAAPI H264 encoder is available. Mirror that decision here so capture
-        // and encode stay in lockstep.
+        // VAAPI encoder for the negotiated codec is available. Mirror that
+        // decision here so capture and encode stay in lockstep.
         #[cfg(all(feature = "hwcodec", target_os = "linux"))]
         if c.produces_dmabuf() {
-            if let Some(hw) = HwRamEncoder::try_get(CodecFormat::H264) {
-                if hw.name.contains("vaapi") {
-                    log::info!("kms dmabuf capture backend uses VAAPI H264 dmabuf encoder");
-                    return EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
-                        name: hw.name,
-                        mc_name: hw.mc_name,
-                        width: c.width & !1,
-                        height: c.height & !1,
-                        quality,
-                        keyframe_interval,
-                    });
-                }
+            let codec = Encoder::negotiated_codec();
+            if let Some(hw) = HwRamEncoder::try_get_vaapi(codec) {
+                log::info!("kms dmabuf capture backend uses VAAPI {codec:?} dmabuf encoder");
+                return EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
+                    name: hw.name,
+                    mc_name: hw.mc_name,
+                    width: c.width & !1,
+                    height: c.height & !1,
+                    quality,
+                    keyframe_interval,
+                });
             }
             // The VAAPI encoder is gone since capture started (e.g. disabled
             // after earlier failures). Give up on dmabuf so the capturer is
             // recreated for the CPU path on the next SWITCH.
             log::warn!(
-                "kms dmabuf capture active but no VAAPI H264 encoder available; disabling dmabuf"
+                "kms dmabuf capture active but no VAAPI {codec:?} encoder available; disabling dmabuf"
             );
             scrap::set_linux_kms_dmabuf_capture_disabled_for_process(true);
         }
@@ -1473,7 +1474,7 @@ fn handle_one_frame(
     first_frame: &mut bool,
     width: usize,
     height: usize,
-) -> ResultType<HashSet<i32>> {
+) -> ResultType<Option<HashSet<i32>>> {
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
         if sps.has_subscribes() {
@@ -1507,6 +1508,13 @@ fn handle_one_frame(
                     send_conn_ids.len()
                 );
             }
+        }
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .map(|err| err.kind() == WouldBlock)
+                .unwrap_or(false) =>
+        {
+            return Ok(None);
         }
         Err(e) => {
             #[cfg(target_os = "linux")]
@@ -1549,7 +1557,7 @@ fn handle_one_frame(
             }
         }
     }
-    Ok(send_conn_ids)
+    Ok(Some(send_conn_ids))
 }
 
 #[inline]

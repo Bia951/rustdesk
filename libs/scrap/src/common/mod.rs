@@ -381,14 +381,17 @@ pub fn is_linux_kms_capture_backend() -> bool {
 #[cfg(x11)]
 #[inline]
 pub fn is_linux_kms_dmabuf_capture_requested() -> bool {
-    std::env::var("RUSTDESK_KMS_DMABUF")
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "y" | "yes"
-            )
-        })
-        .unwrap_or(false)
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var("RUSTDESK_KMS_DMABUF")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "y" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(x11)]
@@ -416,21 +419,26 @@ pub fn is_linux_kms_dmabuf_capture_disabled_for_process() -> bool {
 
 // Whether the VAAPI dmabuf encode path is actually usable right now: hwcodec
 // must be built with libavfilter (needed for the scanout RGB -> NV12 conversion),
-// a VAAPI H264 encoder must be present, and H264 must be the negotiated codec.
-// H265 VAAPI dmabuf encoding is not wired up yet.
+// a VAAPI encoder for the negotiated H264/H265 codec must be present.
 #[cfg(x11)]
 pub fn linux_kms_dmabuf_vaapi_available() -> bool {
     #[cfg(all(feature = "hwcodec", target_os = "linux"))]
     {
         if !crate::hwcodec::HAS_AVFILTER {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!(
+                    "KMS dmabuf capture requires libavfilter for scanout RGB conversion; \
+                     dmabuf capture is unavailable"
+                );
+            });
             return false;
         }
-        if crate::codec::Encoder::negotiated_codec() != CodecFormat::H264 {
+        let codec = crate::codec::Encoder::negotiated_codec();
+        if !matches!(codec, CodecFormat::H264 | CodecFormat::H265) {
             return false;
         }
-        crate::hwcodec::HwRamEncoder::try_get(CodecFormat::H264)
-            .map(|hw| hw.name.contains("vaapi"))
-            .unwrap_or(false)
+        crate::hwcodec::HwRamEncoder::try_get_vaapi(codec).is_some()
     }
     #[cfg(not(all(feature = "hwcodec", target_os = "linux")))]
     {
@@ -450,10 +458,14 @@ pub fn is_linux_kms_dmabuf_capture_enabled_for(is_linear: bool) -> bool {
     if is_linux_kms_dmabuf_capture_disabled_for_process() {
         return false;
     }
+    let requested = is_linux_kms_dmabuf_capture_requested();
+    if is_linear && !requested {
+        return false;
+    }
     if !linux_kms_dmabuf_vaapi_available() {
         return false;
     }
-    is_linux_kms_dmabuf_capture_requested() || !is_linear
+    true
 }
 
 #[cfg(x11)]

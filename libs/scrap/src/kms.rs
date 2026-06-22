@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const HELPER_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 static DMABUF_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -31,6 +31,7 @@ pub struct Display {
     online: bool,
     primary: bool,
     accessible: bool,
+    origin_known: bool,
     // false when the active scanout buffer is tiled/non-linear, so the CPU
     // readback path can't decode it and the dmabuf path is required.
     is_linear: bool,
@@ -58,11 +59,23 @@ impl Display {
         };
         entries.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let mut current_x = 0_i32;
+        let mut current_x = entries
+            .iter()
+            .filter(|entry| entry.origin_known)
+            .map(|entry| {
+                entry
+                    .origin
+                    .0
+                    .saturating_add(entry.width.min(i32::MAX as usize) as i32)
+            })
+            .max()
+            .unwrap_or(0);
         for (index, entry) in entries.iter_mut().enumerate() {
-            entry.origin = (current_x, 0);
+            if !entry.origin_known {
+                entry.origin = (current_x, 0);
+                current_x = current_x.saturating_add(entry.width.min(i32::MAX as usize) as i32);
+            }
             entry.primary = index == 0;
-            current_x = current_x.saturating_add(entry.width as i32);
         }
 
         Ok(entries)
@@ -105,16 +118,18 @@ impl Display {
     }
 
     fn from_helper_display(display: HelperDisplay) -> Self {
+        let origin = display.x.zip(display.y);
         Self {
             card_path: PathBuf::from(display.card_path),
             connector_path: PathBuf::from(display.connector_path),
             name: display.name,
-            origin: (0, 0),
+            origin: origin.unwrap_or((0, 0)),
             width: display.width,
             height: display.height,
             online: display.online,
             primary: false,
             accessible: display.can_open,
+            origin_known: origin.is_some(),
             is_linear: display.is_linear,
         }
     }
@@ -155,6 +170,7 @@ impl Display {
             online: true,
             primary: false,
             accessible,
+            origin_known: false,
             // The sysfs fallback can't read the framebuffer modifier; assume
             // linear so we don't force the dmabuf path on an unverified buffer.
             is_linear: true,
@@ -291,7 +307,7 @@ impl Capturer {
                     format!(
                         "kms display '{}' uses a tiled/non-linear framebuffer the CPU capture \
                          path cannot read; the VAAPI dmabuf path is required but unavailable \
-                         (needs hwcodec built with libavfilter and a VAAPI H264 encoder)",
+                         (needs hwcodec built with libavfilter and a VAAPI H264/H265 encoder)",
                         self.display.name()
                     ),
                 ));
@@ -475,7 +491,6 @@ fn should_retry_privileged_message(message: &str) -> bool {
     lower.contains("permission denied")
         || lower.contains("operation not permitted")
         || lower.contains("no accessible gem handle")
-        || lower.contains("no active framebuffer")
 }
 
 fn parse_pixfmt(pixfmt: &str) -> io::Result<Pixfmt> {
@@ -502,6 +517,10 @@ struct HelperDisplay {
     name: String,
     width: usize,
     height: usize,
+    #[serde(default)]
+    x: Option<i32>,
+    #[serde(default)]
+    y: Option<i32>,
     // Defaulted for forward compatibility; assume linear (CPU path) if absent.
     #[serde(default = "helper_display_default_is_linear")]
     is_linear: bool,
@@ -978,6 +997,48 @@ fn accept_dmabuf_socket(
     listener.set_nonblocking(true)?;
     let started = Instant::now();
     loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Err(child_error(child, "kms dmabuf helper exited before socket connect"));
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "kms dmabuf helper socket connect timed out after {} ms",
+                    timeout.as_millis()
+                ),
+            ));
+        };
+
+        // Wake on a connection instead of repeatedly calling accept while the
+        // helper (or pkexec prompt) is still starting. Use a short poll slice so
+        // an exited child is reported promptly as well.
+        let poll_timeout = remaining.min(Duration::from_millis(250));
+        let timeout_ms = poll_timeout.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let mut pollfd = crate::libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: crate::libc::POLLIN | crate::libc::POLLERR | crate::libc::POLLHUP,
+            revents: 0,
+        };
+        let ret = unsafe { crate::libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if ret == 0 {
+            continue;
+        }
+        if pollfd.revents & (crate::libc::POLLERR | crate::libc::POLLHUP | crate::libc::POLLNVAL)
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "kms dmabuf helper socket listener error",
+            ));
+        }
         match listener.accept() {
             Ok((socket, _)) => {
                 socket.set_nonblocking(false)?;
@@ -986,20 +1047,6 @@ fn accept_dmabuf_socket(
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) => return Err(err),
         }
-
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return Err(child_error(child, "kms dmabuf helper exited before socket connect"));
-        }
-        if started.elapsed() >= timeout {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "kms dmabuf helper socket connect timed out after {} ms",
-                    timeout.as_millis()
-                ),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
