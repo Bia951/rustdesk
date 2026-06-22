@@ -36,6 +36,10 @@ struct ProbeDisplay {
     name: String,
     width: usize,
     height: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    y: Option<i32>,
     // false when the active scanout buffer uses a tiled/compressed modifier the
     // CPU readback path cannot decode; such displays must use the dmabuf path.
     is_linear: bool,
@@ -349,16 +353,18 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
     let card_path = PathBuf::from("/dev/dri").join(card_name);
     let (can_open, open_error) = check_card_access(&card_path);
     let mut is_linear = true;
+    let mut origin = None;
     if can_open {
         if let Ok(card) = open_card(&card_path) {
             let card = Card(card);
             configure_card(&card);
-            if let Ok((active_width, active_height, active_is_linear)) =
+            if let Ok((active_width, active_height, active_is_linear, active_x, active_y)) =
                 active_framebuffer_info(&card, name, width, height)
             {
                 width = active_width;
                 height = active_height;
                 is_linear = active_is_linear;
+                origin = Some((active_x, active_y));
             }
         }
     }
@@ -369,6 +375,8 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
         name: name.to_owned(),
         width,
         height,
+        x: origin.map(|value| value.0),
+        y: origin.map(|value| value.1),
         is_linear,
         online: true,
         can_open,
@@ -396,7 +404,7 @@ fn active_framebuffer_info(
     display_name: &str,
     fallback_width: usize,
     fallback_height: usize,
-) -> ResultType<(usize, usize, bool)> {
+) -> ResultType<(usize, usize, bool, i32, i32)> {
     let connector_name = display_name
         .split_once('-')
         .map(|(_, name)| name)
@@ -424,8 +432,15 @@ fn active_framebuffer_info(
         .context("crtc has no active framebuffer")?;
     let info = card.get_framebuffer(framebuffer)?;
     let size = info.size();
+    let position = crtc.position();
     let is_linear = framebuffer_is_linear(card, framebuffer);
-    Ok((size.0 as usize, size.1 as usize, is_linear))
+    Ok((
+        size.0 as usize,
+        size.1 as usize,
+        is_linear,
+        position.0.min(i32::MAX as u32) as i32,
+        position.1.min(i32::MAX as u32) as i32,
+    ))
 }
 
 fn open_card(card_path: &Path) -> io::Result<std::fs::File> {
@@ -614,17 +629,24 @@ fn capture_framebuffer_dmabuf(
         .unwrap_or_else(|| u64::from(drm::buffer::DrmModifier::Linear));
     let buffers = planar.buffers();
     let fallback_buffer = legacy.buffer();
+    let primary_buffer = buffers[0]
+        .or(fallback_buffer)
+        .context("framebuffer has no accessible GEM handle")?;
+    let pitches = planar.pitches();
+    let offsets = planar.offsets();
     let mut planes = Vec::new();
     let mut fds = Vec::new();
     for (idx, handle) in buffers.iter().enumerate() {
-        let handle = match handle.or(if idx == 0 { fallback_buffer } else { None }) {
-            Some(handle) => handle,
-            None => continue,
-        };
+        if pitches[idx] == 0 {
+            continue;
+        }
+        // drmModeGetFB2 may report a handle only for plane 0 when multiple
+        // planes (for example NV12 Y and UV) share one GEM object.
+        let handle = handle.unwrap_or(primary_buffer);
         fds.push(card.buffer_to_prime_fd(handle, 0)?);
         planes.push(DmabufPlaneOutput {
-            stride: planar.pitches()[idx],
-            offset: planar.offsets()[idx],
+            stride: pitches[idx],
+            offset: offsets[idx],
         });
     }
     if planes.is_empty() {
@@ -654,6 +676,10 @@ fn capture_framebuffer_dmabuf(
 // desktop session unable to modeset, blanking the screen.
 fn configure_card(card: &Card) {
     let _ = card.set_client_capability(ClientCapability::UniversalPlanes, true);
+    // Enable atomic so planes expose their CRTC_ID/FB_ID/type properties, which
+    // resolve_framebuffers uses to find the PRIMARY (desktop) plane. Read-only — we
+    // never commit; if the driver lacks atomic the call just fails and is ignored.
+    let _ = card.set_client_capability(ClientCapability::Atomic, true);
 }
 
 fn should_retry_privileged(err: &hbb_common::anyhow::Error) -> bool {
@@ -661,7 +687,6 @@ fn should_retry_privileged(err: &hbb_common::anyhow::Error) -> bool {
     text.contains("permission denied")
         || text.contains("operation not permitted")
         || text.contains("no accessible gem handle")
-        || text.contains("no active framebuffer")
 }
 
 fn retry_privileged_frame(display_name: &str) -> ResultType<FrameCapture> {
@@ -771,6 +796,63 @@ fn resolve_framebuffers(
     min_width: usize,
     min_height: usize,
 ) -> ResultType<Vec<control::framebuffer::Handle>> {
+    // Preferred: pick planes by their standardized DRM atomic *properties*, not the
+    // legacy GetPlane fields. Wayland/atomic compositors (KWin, mutter, …) drive the
+    // planes via atomic state and leave the legacy crtc_id/fb_id at 0, so the old
+    // size heuristic missed the desktop (PRIMARY) plane and grabbed the 64x64 CURSOR
+    // plane. Plane `type` is device-independent (OVERLAY=0, PRIMARY=1, CURSOR=2);
+    // `CRTC_ID` says which CRTC it's on; `FB_ID` is the currently bound framebuffer.
+    const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+    const DRM_PLANE_TYPE_CURSOR: u64 = 2;
+    let crtc_id: u32 = crtc_handle.into();
+    let mut typed: Vec<(u64, control::framebuffer::Handle)> = Vec::new();
+    if let Ok(planes) = card.plane_handles() {
+        for plane_handle in planes {
+            let Ok(props) = card.get_properties(plane_handle) else {
+                continue;
+            };
+            let mut p_type: Option<u64> = None;
+            let mut p_crtc: Option<u32> = None;
+            let mut p_fb: Option<u32> = None;
+            for (prop, value) in props.iter() {
+                let Ok(info) = card.get_property(*prop) else {
+                    continue;
+                };
+                match info.name().to_str() {
+                    Ok("type") => p_type = Some(*value),
+                    Ok("CRTC_ID") => p_crtc = Some(*value as u32),
+                    Ok("FB_ID") => p_fb = Some(*value as u32),
+                    _ => {}
+                }
+            }
+            if p_crtc != Some(crtc_id) {
+                continue; // not scanned out on our CRTC
+            }
+            let Some(fb_raw) = p_fb.filter(|fb| *fb != 0) else {
+                continue; // no framebuffer currently bound
+            };
+            let Some(fb) = control::from_u32::<control::framebuffer::Handle>(fb_raw) else {
+                continue;
+            };
+            let ty = p_type.unwrap_or(0);
+            if ty == DRM_PLANE_TYPE_CURSOR {
+                continue; // never capture the cursor sprite
+            }
+            typed.push((ty, fb));
+        }
+    }
+    if !typed.is_empty() {
+        // PRIMARY (the desktop) first; overlays after, as fallbacks.
+        typed.sort_by_key(|(ty, _)| if *ty == DRM_PLANE_TYPE_PRIMARY { 0 } else { 1 });
+        let mut framebuffers = Vec::new();
+        for (_, fb) in typed {
+            push_unique_framebuffer(&mut framebuffers, fb);
+        }
+        return Ok(framebuffers);
+    }
+
+    // Fallback for non-atomic drivers / when properties are unavailable: legacy
+    // fields plus the CRTC's own framebuffer, ranked by mode coverage then area.
     let mut candidates = Vec::new();
     for plane_handle in card.plane_handles()? {
         let plane = match card.get_plane(plane_handle) {
