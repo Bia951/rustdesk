@@ -68,8 +68,7 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
     }
     #[cfg(target_os = "ios")]
     {
-        use hbb_common::env_logger::*;
-        init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "debug"));
+        hbb_common::init_env_logger("debug");
         crate::common::test_nat_type();
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]

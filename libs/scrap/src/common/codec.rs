@@ -195,7 +195,7 @@ impl Encoder {
     }
 
     pub fn update(update: EncodingUpdate) {
-        log::info!("update:{:?}", update);
+        log::debug!("update:{:?}", update);
         let mut decodings = PEER_DECODINGS.lock().unwrap();
         match update {
             EncodingUpdate::Update(id, decoding) => {

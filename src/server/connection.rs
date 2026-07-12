@@ -1931,7 +1931,7 @@ impl Connection {
         } else if self.view_camera {
             let supported_encoding = scrap::codec::Encoder::supported_encoding();
             self.last_supported_encoding = Some(supported_encoding.clone());
-            log::info!("peer info supported_encoding: {:?}", supported_encoding);
+            log::debug!("peer info supported_encoding: {:?}", supported_encoding);
             pi.encoding = Some(supported_encoding).into();
 
             pi.displays = camera::Cameras::all_info().unwrap_or(Vec::new());
@@ -1954,7 +1954,7 @@ impl Connection {
         } else {
             let supported_encoding = scrap::codec::Encoder::supported_encoding();
             self.last_supported_encoding = Some(supported_encoding.clone());
-            log::info!("peer info supported_encoding: {:?}", supported_encoding);
+            log::debug!("peer info supported_encoding: {:?}", supported_encoding);
             pi.encoding = Some(supported_encoding).into();
             if let Some(msg_out) = super::display_service::is_inited_msg() {
                 self.send(msg_out).await;
@@ -4557,7 +4557,7 @@ impl Connection {
     }
 
     async fn update_options(&mut self, o: &OptionMessage) {
-        log::info!("Option update: {:?}", o);
+        log::debug!("Option update: {:?}", o);
         if let Ok(q) = o.image_quality.enum_value() {
             let image_quality;
             if let ImageQuality::NotSet = q {
