@@ -14,7 +14,7 @@ use std::{
     fs::OpenOptions,
     io::{self, BufRead, BufReader, ErrorKind, Write},
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
-    os::unix::net::UnixStream,
+    os::unix::net::UnixDatagram,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -34,6 +34,8 @@ struct ProbeDisplay {
     card_path: String,
     connector_path: String,
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    render_node: Option<String>,
     width: usize,
     height: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +45,7 @@ struct ProbeDisplay {
     // false when the active scanout buffer uses a tiled/compressed modifier the
     // CPU readback path cannot decode; such displays must use the dmabuf path.
     is_linear: bool,
+    modifier_known: bool,
     online: bool,
     can_open: bool,
     open_error: Option<String>,
@@ -70,6 +73,8 @@ struct DmabufFrameOutput {
     card_path: String,
     connector_path: String,
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    render_node: Option<String>,
     width: usize,
     height: usize,
     fourcc: u32,
@@ -152,7 +157,7 @@ fn write_frame(frame: &FrameCapture) -> ResultType<()> {
     Ok(())
 }
 
-fn write_dmabuf_frame(socket: &UnixStream, frame: &DmabufFrameCapture) -> ResultType<()> {
+fn write_dmabuf_frame(socket: &UnixDatagram, frame: &DmabufFrameCapture) -> ResultType<()> {
     let mut header = serde_json::to_vec(&frame.header)?;
     header.push(b'\n');
     let fds = frame
@@ -196,8 +201,18 @@ fn send_fds(socket_fd: RawFd, bytes: &[u8], fds: &[RawFd]) -> io::Result<()> {
             msg_controllen: control.len() as _,
             msg_flags: 0,
         };
-        if libc::sendmsg(socket_fd, &msg, 0) < 0 {
+        let written = libc::sendmsg(socket_fd, &msg, 0);
+        if written < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if written as usize != bytes.len() {
+            return Err(io::Error::new(
+                ErrorKind::WriteZero,
+                format!(
+                    "short kms dmabuf datagram write: expected {}, wrote {written}",
+                    bytes.len()
+                ),
+            ));
         }
     }
     Ok(())
@@ -300,7 +315,10 @@ fn stream_dmabuf(display_name: &str, socket_path: &str, privileged: bool) -> Res
 
     let card = Card(open_card(Path::new(&display.card_path))?);
     configure_card(&card);
-    let socket = UnixStream::connect(socket_path)
+    let socket = UnixDatagram::unbound()
+        .context("failed to create kms dmabuf datagram socket")?;
+    socket
+        .connect(socket_path)
         .with_context(|| format!("failed to connect kms dmabuf socket {socket_path}"))?;
 
     let stdout = io::stdout();
@@ -351,8 +369,10 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
         .map(|(card, _)| card)
         .context("invalid drm connector name")?;
     let card_path = PathBuf::from("/dev/dri").join(card_name);
+    let render_node = find_render_node(&card_path).map(|path| path.display().to_string());
     let (can_open, open_error) = check_card_access(&card_path);
     let mut is_linear = true;
+    let mut modifier_known = false;
     let mut origin = None;
     if can_open {
         if let Ok(card) = open_card(&card_path) {
@@ -364,6 +384,7 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
                 width = active_width;
                 height = active_height;
                 is_linear = active_is_linear;
+                modifier_known = true;
                 origin = Some((active_x, active_y));
             }
         }
@@ -373,11 +394,13 @@ fn probe_display(path: PathBuf) -> ResultType<Option<ProbeDisplay>> {
         card_path: card_path.display().to_string(),
         connector_path: path.display().to_string(),
         name: name.to_owned(),
+        render_node,
         width,
         height,
         x: origin.map(|value| value.0),
         y: origin.map(|value| value.1),
         is_linear,
+        modifier_known,
         online: true,
         can_open,
         open_error,
@@ -604,6 +627,25 @@ fn capture_framebuffer(
     })
 }
 
+fn find_render_node(card_path: &Path) -> Option<PathBuf> {
+    let card_name = card_path.file_name()?.to_str()?;
+    let drm_dir = PathBuf::from("/sys/class/drm")
+        .join(card_name)
+        .join("device/drm");
+    let mut nodes = fs::read_dir(drm_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.starts_with("renderD")
+                .then(|| PathBuf::from("/dev/dri").join(name))
+        })
+        .collect::<Vec<_>>();
+    nodes.sort();
+    nodes.into_iter().next()
+}
+
 fn capture_framebuffer_dmabuf(
     card: &Card,
     display: &ProbeDisplay,
@@ -658,6 +700,7 @@ fn capture_framebuffer_dmabuf(
             card_path: display.card_path.clone(),
             connector_path: display.connector_path.clone(),
             name: display.name.clone(),
+            render_node: display.render_node.clone(),
             width: planar.size().0 as usize,
             height: planar.size().1 as usize,
             fourcc: drm_format as u32,

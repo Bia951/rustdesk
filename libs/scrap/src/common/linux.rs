@@ -63,6 +63,20 @@ impl TraitCapturer for Capturer {
             _ => false,
         }
     }
+
+    fn dmabuf_device_path(&self) -> Option<String> {
+        match self {
+            Capturer::KMS(d) => d.dmabuf_device_path(),
+            _ => None,
+        }
+    }
+
+    fn dmabuf_cpu_fallback_safe(&self) -> bool {
+        match self {
+            Capturer::KMS(d) => d.dmabuf_cpu_fallback_safe(),
+            _ => false,
+        }
+    }
 }
 
 pub enum Display {

@@ -29,7 +29,7 @@ use hwcodec::{
     },
 };
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::{convert::TryFrom, os::fd::AsRawFd};
 
 const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
 pub const DEFAULT_FPS: i32 = 30;
@@ -62,6 +62,7 @@ pub struct HwRamEncoderConfig {
 pub struct HwDmabufEncoderConfig {
     pub name: String,
     pub mc_name: Option<String>,
+    pub device_path: Option<String>,
     pub width: usize,
     pub height: usize,
     pub quality: f32,
@@ -293,7 +294,7 @@ impl EncoderApi for HwDmabufEncoder {
                         )))
                     }
                 };
-                match Encoder::new(ctx.clone()) {
+                match Encoder::new_with_device(ctx.clone(), config.device_path.as_deref()) {
                     Ok(encoder) => Ok(HwDmabufEncoder {
                         encoder,
                         format,
@@ -448,8 +449,130 @@ impl EncoderApi for HwDmabufEncoder {
         true
     }
 
+    fn is_dmabuf(&self) -> bool {
+        true
+    }
+
+    fn download_dmabuf_rgba(
+        &mut self,
+        frame: &crate::DmabufFrame,
+    ) -> ResultType<(usize, usize, Vec<u8>)> {
+        self.download_rgba(frame)
+    }
+
     fn disable(&self) {
-        HwCodecConfig::clear(false, true);
+        crate::set_linux_kms_dmabuf_capture_disabled_for_process(true);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl HwDmabufEncoder {
+    pub fn download_rgba(
+        &mut self,
+        frame: &crate::DmabufFrame,
+    ) -> ResultType<(usize, usize, Vec<u8>)> {
+        let dmabuf = HwcodecDmabufFrame {
+            width: frame.width,
+            height: frame.height,
+            encode_width: self.config.width,
+            encode_height: self.config.height,
+            fourcc: frame.fourcc,
+            modifier: frame.modifier,
+            planes: frame
+                .planes
+                .iter()
+                .map(|plane| HwcodecDmabufPlane {
+                    fd: plane.fd.as_raw_fd(),
+                    stride: plane.stride,
+                    offset: plane.offset,
+                })
+                .collect(),
+        };
+        let downloaded = self
+            .encoder
+            .download_dmabuf(&dmabuf)
+            .map_err(|err| anyhow!("Failed to download dmabuf: {err}"))?;
+        downloaded_nv12_to_rgba(&downloaded)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn downloaded_nv12_to_rgba(
+    downloaded: &DecodeFrame,
+) -> ResultType<(usize, usize, Vec<u8>)> {
+    if downloaded.pixfmt != AVPixelFormat::AV_PIX_FMT_NV12
+        || downloaded.width <= 0
+        || downloaded.height <= 0
+        || downloaded.data.len() < 2
+        || downloaded.linesize.len() < 2
+    {
+        bail!(
+            "invalid downloaded dmabuf frame: format={:?}, size={}x{}, planes={}",
+            downloaded.pixfmt,
+            downloaded.width,
+            downloaded.height,
+            downloaded.data.len()
+        );
+    }
+    let width = downloaded.width as usize;
+    let height = downloaded.height as usize;
+    let y_stride = usize::try_from(downloaded.linesize[0])
+        .map_err(|_| anyhow!("invalid downloaded dmabuf Y stride"))?;
+    let uv_stride = usize::try_from(downloaded.linesize[1])
+        .map_err(|_| anyhow!("invalid downloaded dmabuf UV stride"))?;
+    let y_len = y_stride
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("downloaded dmabuf Y plane size overflow"))?;
+    let uv_len = uv_stride
+        .checked_mul((height + 1) / 2)
+        .ok_or_else(|| anyhow!("downloaded dmabuf UV plane size overflow"))?;
+    if y_stride < width
+        || uv_stride < width
+        || downloaded.data[0].len() < y_len
+        || downloaded.data[1].len() < uv_len
+    {
+        bail!("downloaded dmabuf plane is smaller than its declared layout");
+    }
+    let rgba_stride = width
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("downloaded dmabuf RGBA stride overflow"))?;
+    let rgba_len = rgba_stride
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("downloaded dmabuf RGBA size overflow"))?;
+    let mut rgba = vec![0_u8; rgba_len];
+    call_yuv!(NV12ToABGR(
+        downloaded.data[0].as_ptr(),
+        downloaded.linesize[0],
+        downloaded.data[1].as_ptr(),
+        downloaded.linesize[1],
+        rgba.as_mut_ptr(),
+        i32::try_from(rgba_stride)
+            .map_err(|_| anyhow!("downloaded dmabuf RGBA stride overflow"))?,
+        downloaded.width,
+        downloaded.height,
+    ));
+    Ok((width, height, rgba))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod dmabuf_download_tests {
+    use super::*;
+
+    #[test]
+    fn converts_downloaded_nv12_to_rgba() {
+        let downloaded = DecodeFrame {
+            pixfmt: AVPixelFormat::AV_PIX_FMT_NV12,
+            width: 2,
+            height: 2,
+            data: vec![vec![16; 4], vec![128; 2]],
+            linesize: vec![2, 2],
+            key: false,
+        };
+
+        let (width, height, rgba) = downloaded_nv12_to_rgba(&downloaded).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(rgba.len(), 16);
+        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 0xff));
     }
 }
 

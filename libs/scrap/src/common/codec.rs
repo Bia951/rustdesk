@@ -81,6 +81,19 @@ pub trait EncoderApi {
 
     fn is_hardware(&self) -> bool;
 
+    #[cfg(target_os = "linux")]
+    fn is_dmabuf(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn download_dmabuf_rgba(
+        &mut self,
+        _frame: &crate::DmabufFrame,
+    ) -> ResultType<(usize, usize, Vec<u8>)> {
+        bail!("encoder does not support dmabuf download")
+    }
+
     fn disable(&self);
 }
 
@@ -161,10 +174,8 @@ impl Encoder {
                     codec: Box::new(hw),
                 }),
                 Err(e) => {
-                    log::error!("new dmabuf hw encoder failed: {e:?}, clear config");
+                    log::error!("new dmabuf hw encoder failed: {e:?}");
                     crate::set_linux_kms_dmabuf_capture_disabled_for_process(true);
-                    HwCodecConfig::clear(false, true);
-                    *ENCODE_CODEC_FORMAT.lock().unwrap() = CodecFormat::VP9;
                     Err(e)
                 }
             },

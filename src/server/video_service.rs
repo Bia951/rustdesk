@@ -90,6 +90,12 @@ struct Screenshot {
     restore_vram: bool,
 }
 
+enum ScreenshotJob {
+    Ready(String, usize, usize, Vec<u8>),
+    #[cfg(target_os = "linux")]
+    Dmabuf(scrap::DmabufFrame),
+}
+
 #[inline]
 pub fn notify_video_frame_fetched(display_idx: usize, conn_id: i32, frame_tm: Option<Instant>) {
     if let Some(notifier) = FRAME_FETCHED_NOTIFIERS.lock().unwrap().get(&display_idx) {
@@ -314,6 +320,26 @@ fn create_capturer(
     };
 }
 
+fn create_command_capturer(
+    display: Display,
+    display_idx: usize,
+    force_kms_dmabuf: bool,
+) -> ResultType<Box<dyn TraitCapturer>> {
+    #[cfg(target_os = "linux")]
+    let display = match display {
+        Display::KMS(display) if force_kms_dmabuf => {
+            return Ok(Box::new(
+                scrap::kms::Capturer::new_dmabuf(display)
+                    .with_context(|| "Failed to create KMS dmabuf capturer")?,
+            ));
+        }
+        display => display,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = force_kms_dmabuf;
+    create_capturer(0, display, display_idx, false)
+}
+
 // This function works on privacy mode. Windows only for now.
 pub fn test_create_capturer(
     privacy_mode_id: i32,
@@ -360,7 +386,7 @@ pub fn test_capture_frame(display_idx: usize, timeout_millis: u64) -> String {
                 );
             }
             let display = displays.remove(display_idx);
-            let mut capturer = create_capturer(0, display, display_idx, false)?;
+            let mut capturer = create_command_capturer(display, display_idx, true)?;
             match capturer.frame(Duration::from_millis(0)) {
                 Ok(Frame::PixelBuffer(frame)) => Ok(format!(
                     "ok width={} height={} stride={} pixfmt={:?} bytes={}",
@@ -409,7 +435,7 @@ pub fn dump_capture_frame(display_idx: usize, path: &str, timeout_millis: u64) -
                 );
             }
             let display = displays.remove(display_idx);
-            let mut capturer = create_capturer(0, display, display_idx, false)?;
+            let mut capturer = create_command_capturer(display, display_idx, true)?;
             match capturer.frame(Duration::from_millis(0)) {
                 Ok(Frame::PixelBuffer(frame)) => {
                     let width = frame.width();
@@ -429,7 +455,9 @@ pub fn dump_capture_frame(display_idx: usize, path: &str, timeout_millis: u64) -
                 }
                 Ok(Frame::Texture(_)) => bail!("texture frame cannot be dumped as png here"),
                 #[cfg(target_os = "linux")]
-                Ok(Frame::Dmabuf(_)) => bail!("dmabuf frame cannot be dumped as png here"),
+                Ok(Frame::Dmabuf(frame)) => {
+                    dump_dmabuf_frame_in_worker(&frame, path)
+                }
                 Err(err) => Err(err.into()),
             }
         })();
@@ -460,7 +488,7 @@ pub fn test_encode_dmabuf_frame(display_idx: usize, timeout_millis: u64) -> Stri
                 );
             }
             let display = displays.remove(display_idx);
-            let mut capturer = create_capturer(0, display, display_idx, false)?;
+            let mut capturer = create_command_capturer(display, display_idx, true)?;
             match capturer.frame(Duration::from_millis(0))? {
                 Frame::Dmabuf(frame) => Ok(frame),
                 Frame::PixelBuffer(_) => bail!("expected dmabuf frame, got pixel buffer"),
@@ -485,6 +513,7 @@ pub fn test_encode_dmabuf_frame(display_idx: usize, timeout_millis: u64) -> Stri
             EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
                 name: "h264_vaapi".to_owned(),
                 mc_name: None,
+                device_path: frame.render_node.clone(),
                 width: encode_width,
                 height: encode_height,
                 quality: 1.0,
@@ -535,6 +564,60 @@ fn even_encoder_size(width: usize, height: usize) -> ResultType<(usize, usize)> 
         bail!("invalid dmabuf encoder size: {width}x{height}");
     }
     Ok((width, height))
+}
+
+#[cfg(all(feature = "hwcodec", target_os = "linux"))]
+fn download_dmabuf_frame_rgba(
+    frame: &scrap::DmabufFrame,
+) -> ResultType<(usize, usize, Vec<u8>)> {
+    let (width, height) = even_encoder_size(frame.width, frame.height)?;
+    let hw = scrap::hwcodec::HwRamEncoder::try_get_vaapi(CodecFormat::H264)
+        .or_else(|| scrap::hwcodec::HwRamEncoder::try_get_vaapi(CodecFormat::H265))
+        .ok_or_else(|| anyhow!("no VAAPI H264/H265 encoder is available for dmabuf download"))?;
+    let mut encoder = scrap::hwcodec::HwDmabufEncoder::new(
+        EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
+            name: hw.name,
+            mc_name: hw.mc_name,
+            device_path: frame.render_node.clone(),
+            width,
+            height,
+            quality: 1.0,
+            keyframe_interval: None,
+        }),
+        false,
+    )?;
+    encoder.download_rgba(frame)
+}
+
+#[cfg(all(not(feature = "hwcodec"), target_os = "linux"))]
+fn download_dmabuf_frame_rgba(
+    _frame: &scrap::DmabufFrame,
+) -> ResultType<(usize, usize, Vec<u8>)> {
+    bail!("dmabuf download requires a Linux hwcodec build")
+}
+
+#[cfg(target_os = "linux")]
+fn dump_dmabuf_frame_in_worker(frame: &scrap::DmabufFrame, path: &str) -> ResultType<String> {
+    let frame = frame
+        .try_clone()
+        .with_context(|| "Failed to duplicate dmabuf frame for dump worker")?;
+    let path = path.to_owned();
+    std::thread::spawn(move || -> ResultType<String> {
+        let (width, height, rgba) = download_dmabuf_frame_rgba(&frame)?;
+        let png = encode_png(width, height, rgba)?;
+        fs::write(Path::new(&path), png)?;
+        Ok(format!(
+            "ok saved={} width={} height={} fourcc={} modifier={} planes={}",
+            path,
+            width,
+            height,
+            frame.fourcc,
+            frame.modifier,
+            frame.planes.len()
+        ))
+    })
+    .join()
+    .map_err(|_| anyhow!("dmabuf dump worker panicked"))?
 }
 
 // Note: This function is extremely expensive, do not call it frequently.
@@ -811,6 +894,9 @@ fn run(vs: VideoService) -> ResultType<()> {
         && scrap::is_linux_kms_capture_backend()
         && c.produces_dmabuf();
     #[cfg(target_os = "linux")]
+    let kms_dmabuf_cpu_fallback_safe =
+        kms_dmabuf_enabled_at_capture && c.dmabuf_cpu_fallback_safe();
+    #[cfg(target_os = "linux")]
     if vs.source.is_monitor()
         && scrap::is_linux_kms_capture_backend()
         && crate::input_service::wayland_use_uinput()
@@ -849,10 +935,15 @@ fn run(vs: VideoService) -> ResultType<()> {
             if kms_dmabuf_enabled_at_capture
                 && scrap::is_linux_kms_dmabuf_capture_disabled_for_process()
             {
-                log::warn!(
-                    "Failed to create KMS dmabuf encoder: {err:?}; recreate capturer without dmabuf capture"
+                if kms_dmabuf_cpu_fallback_safe {
+                    log::warn!(
+                        "Failed to create KMS dmabuf encoder: {err:?}; recreate capturer without dmabuf capture"
+                    );
+                    bail!("SWITCH");
+                }
+                return Err(err).context(
+                    "Failed to create KMS dmabuf encoder and CPU readback is not known to be safe",
                 );
-                bail!("SWITCH");
             }
             log::error!("Failed to create encoder: {err:?}, fallback to VP9");
             Encoder::set_fallback(&EncoderCfg::VPX(VpxEncoderConfig {
@@ -875,7 +966,19 @@ fn run(vs: VideoService) -> ResultType<()> {
         }
     };
     #[cfg(target_os = "linux")]
-    if kms_dmabuf_enabled_at_capture && scrap::is_linux_kms_dmabuf_capture_disabled_for_process() {
+    if kms_dmabuf_enabled_at_capture && !encoder.is_dmabuf() {
+        if kms_dmabuf_cpu_fallback_safe {
+            log::info!("recreate KMS capturer because no dmabuf encoder is available");
+            bail!("SWITCH");
+        }
+        bail!(
+            "KMS dmabuf capture requires a VAAPI dmabuf encoder; CPU readback is not safe for this framebuffer"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if kms_dmabuf_cpu_fallback_safe
+        && scrap::is_linux_kms_dmabuf_capture_disabled_for_process()
+    {
         log::info!("recreate KMS capturer without dmabuf capture after it was disabled");
         bail!("SWITCH");
     }
@@ -1011,23 +1114,33 @@ fn run(vs: VideoService) -> ResultType<()> {
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {
                         let restore_vram = screenshot.restore_vram;
-                        let (msg, w, h, data) = match &frame {
+                        let job = match &frame {
                             scrap::Frame::PixelBuffer(f) => match get_rgba_from_pixelbuf(f) {
-                                Ok(rgba) => ("".to_owned(), f.width(), f.height(), rgba),
+                                Ok(rgba) => ScreenshotJob::Ready(
+                                    "".to_owned(),
+                                    f.width(),
+                                    f.height(),
+                                    rgba,
+                                ),
                                 Err(e) => {
                                     let serr = e.to_string();
                                     log::error!(
                                         "Failed to convert the pix format into rgba, {}",
                                         &serr
                                     );
-                                    (format!("Convert pixfmt: {}", serr), 0, 0, vec![])
+                                    ScreenshotJob::Ready(
+                                        format!("Convert pixfmt: {}", serr),
+                                        0,
+                                        0,
+                                        vec![],
+                                    )
                                 }
                             },
                             scrap::Frame::Texture(_) => {
                                 if restore_vram {
                                     // Already set one time, just ignore to break infinite loop.
                                     // Though it's unreachable, this branch is kept to avoid infinite loop.
-                                    (
+                                    ScreenshotJob::Ready(
                                         "Please change codec and try again.".to_owned(),
                                         0,
                                         0,
@@ -1046,15 +1159,18 @@ fn run(vs: VideoService) -> ResultType<()> {
                                 }
                             }
                             #[cfg(target_os = "linux")]
-                            scrap::Frame::Dmabuf(_) => (
-                                "Dmabuf screenshots are not supported yet.".to_owned(),
-                                0,
-                                0,
-                                vec![],
-                            ),
+                            scrap::Frame::Dmabuf(frame) => match frame.try_clone() {
+                                Ok(frame) => ScreenshotJob::Dmabuf(frame),
+                                Err(err) => ScreenshotJob::Ready(
+                                    format!("Duplicate dmabuf: {err}"),
+                                    0,
+                                    0,
+                                    vec![],
+                                ),
+                            },
                         };
                         std::thread::spawn(move || {
-                            handle_screenshot(screenshot, msg, w, h, data);
+                            handle_screenshot_job(screenshot, job);
                         });
                         if restore_vram {
                             bail!("SWITCH");
@@ -1073,6 +1189,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                         &mut first_frame,
                         capture_width,
                         capture_height,
+                        #[cfg(target_os = "linux")]
+                        kms_dmabuf_cpu_fallback_safe,
                     )? {
                         frame_controller.set_send(now, send_conn_ids);
                         send_counter += 1;
@@ -1133,6 +1251,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                             &mut first_frame,
                             capture_width,
                             capture_height,
+                            #[cfg(target_os = "linux")]
+                            kms_dmabuf_cpu_fallback_safe,
                         )? {
                             frame_controller.set_send(now, send_conn_ids);
                             send_counter += 1;
@@ -1273,10 +1393,9 @@ fn get_encoder_config(
     let keyframe_interval = if record { Some(240) } else { None };
     #[cfg(target_os = "linux")]
     if _source.is_monitor() && scrap::is_linux_kms_capture_backend() {
-        // The capturer already decided whether to emit dmabuf frames (explicit
-        // opt-in or auto-selected for a tiled display), and only does so when a
-        // VAAPI encoder for the negotiated codec is available. Mirror that
-        // decision here so capture and encode stay in lockstep.
+        // The capturer already decided whether to emit dmabuf frames and only
+        // does so when a VAAPI encoder for the negotiated codec is available.
+        // Mirror that decision here so capture and encode stay in lockstep.
         #[cfg(all(feature = "hwcodec", target_os = "linux"))]
         if c.produces_dmabuf() {
             let codec = Encoder::negotiated_codec();
@@ -1285,15 +1404,16 @@ fn get_encoder_config(
                 return EncoderCfg::HWDMABUF(HwDmabufEncoderConfig {
                     name: hw.name,
                     mc_name: hw.mc_name,
+                    device_path: c.dmabuf_device_path(),
                     width: c.width & !1,
                     height: c.height & !1,
                     quality,
                     keyframe_interval,
                 });
             }
-            // The VAAPI encoder is gone since capture started (e.g. disabled
-            // after earlier failures). Give up on dmabuf so the capturer is
-            // recreated for the CPU path on the next SWITCH.
+            // The VAAPI encoder disappeared since capture started. Linear
+            // displays can be recreated on the CPU path; non-linear displays
+            // will keep reporting that dmabuf/VAAPI is required.
             log::warn!(
                 "kms dmabuf capture active but no VAAPI {codec:?} encoder available; disabling dmabuf"
             );
@@ -1474,6 +1594,7 @@ fn handle_one_frame(
     first_frame: &mut bool,
     width: usize,
     height: usize,
+    #[cfg(target_os = "linux")] kms_dmabuf_cpu_fallback_safe: bool,
 ) -> ResultType<Option<HashSet<i32>>> {
     sp.snapshot(|sps| {
         // so that new sub and old sub share the same encoder after switch
@@ -1518,14 +1639,21 @@ fn handle_one_frame(
         }
         Err(e) => {
             #[cfg(target_os = "linux")]
-            if scrap::is_linux_kms_capture_backend()
-                && scrap::is_linux_kms_dmabuf_capture_requested()
-                && !scrap::is_linux_kms_dmabuf_capture_enabled()
-                && encoder.is_hardware()
-            {
-                encoder.disable();
-                log::error!("switch due to KMS dmabuf encoder failure: {e:?}");
-                bail!("SWITCH");
+            if scrap::is_linux_kms_capture_backend() && encoder.is_dmabuf() {
+                *encode_fail_counter += 1;
+                if kms_dmabuf_cpu_fallback_safe
+                    && scrap::is_linux_kms_dmabuf_capture_disabled_for_process()
+                {
+                    log::error!(
+                        "switch after repeated KMS dmabuf encoder failures: {e:?}"
+                    );
+                    bail!("SWITCH");
+                }
+                log::error!(
+                    "KMS dmabuf encode failed: {e:?}, consecutive attempts: {}",
+                    *encode_fail_counter
+                );
+                return Ok(None);
             }
             *encode_fail_counter += 1;
             // Encoding errors are not frequent except on Android
@@ -1779,4 +1907,19 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
     {
         log::error!("Failed to send screenshot, {}", e);
     }
+}
+
+fn handle_screenshot_job(screenshot: Screenshot, job: ScreenshotJob) {
+    let (msg, width, height, data) = match job {
+        ScreenshotJob::Ready(msg, width, height, data) => (msg, width, height, data),
+        #[cfg(target_os = "linux")]
+        ScreenshotJob::Dmabuf(frame) => match download_dmabuf_frame_rgba(&frame) {
+            Ok((width, height, rgba)) => ("".to_owned(), width, height, rgba),
+            Err(err) => {
+                log::error!("Failed to download dmabuf screenshot: {err:?}");
+                (format!("Download dmabuf: {err}"), 0, 0, vec![])
+            }
+        },
+    };
+    handle_screenshot(screenshot, msg, width, height, data);
 }

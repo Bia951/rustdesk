@@ -150,6 +150,14 @@ pub trait TraitCapturer {
         false
     }
 
+    fn dmabuf_device_path(&self) -> Option<String> {
+        None
+    }
+
+    fn dmabuf_cpu_fallback_safe(&self) -> bool {
+        false
+    }
+
     #[cfg(windows)]
     fn is_gdi(&self) -> bool;
     #[cfg(windows)]
@@ -202,6 +210,8 @@ pub struct DmabufPlane {
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct DmabufFrame {
+    pub card_path: String,
+    pub render_node: Option<String>,
     pub width: usize,
     pub height: usize,
     pub fourcc: u32,
@@ -216,6 +226,78 @@ impl DmabufFrame {
             && self.height > 0
             && !self.planes.is_empty()
             && self.planes.iter().all(|plane| plane.fd.as_raw_fd() >= 0)
+    }
+
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        let planes = self
+            .planes
+            .iter()
+            .map(|plane| {
+                Ok(DmabufPlane {
+                    fd: plane.fd.try_clone()?,
+                    stride: plane.stride,
+                    offset: plane.offset,
+                })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self {
+            card_path: self.card_path.clone(),
+            render_node: self.render_node.clone(),
+            width: self.width,
+            height: self.height,
+            fourcc: self.fourcc,
+            modifier: self.modifier,
+            planes,
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod dmabuf_frame_tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn cloned_dmabuf_owns_independent_cloexec_fds() {
+        let y_file = File::open("/dev/null").unwrap();
+        let uv_file = File::open("/dev/null").unwrap();
+        let frame = DmabufFrame {
+            card_path: "/dev/dri/card1".to_owned(),
+            render_node: Some("/dev/dri/renderD129".to_owned()),
+            width: 16,
+            height: 8,
+            fourcc: 0x3432_5258,
+            modifier: 0,
+            planes: vec![
+                DmabufPlane {
+                    fd: y_file.into(),
+                    stride: 64,
+                    offset: 0,
+                },
+                DmabufPlane {
+                    fd: uv_file.into(),
+                    stride: 64,
+                    offset: 512,
+                },
+            ],
+        };
+
+        let cloned = frame.try_clone().unwrap();
+        assert_eq!(cloned.planes.len(), 2);
+        for (source, duplicate) in frame.planes.iter().zip(&cloned.planes) {
+            assert_ne!(source.fd.as_raw_fd(), duplicate.fd.as_raw_fd());
+            assert_eq!(source.stride, duplicate.stride);
+            assert_eq!(source.offset, duplicate.offset);
+        }
+        assert_eq!(frame.card_path, cloned.card_path);
+        assert_eq!(frame.render_node, cloned.render_node);
+        drop(frame);
+
+        for plane in &cloned.planes {
+            let flags = unsafe { crate::libc::fcntl(plane.fd.as_raw_fd(), crate::libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & crate::libc::FD_CLOEXEC, 0);
+        }
     }
 }
 
@@ -397,8 +479,7 @@ pub fn is_linux_kms_dmabuf_capture_requested() -> bool {
 #[cfg(x11)]
 #[inline]
 pub fn is_linux_kms_dmabuf_capture_enabled() -> bool {
-    is_linux_kms_dmabuf_capture_requested()
-        && !LINUX_KMS_DMABUF_CAPTURE_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+    !is_linux_kms_dmabuf_capture_disabled_for_process() && linux_kms_dmabuf_vaapi_available()
 }
 
 #[cfg(x11)]
@@ -409,6 +490,9 @@ static LINUX_KMS_DMABUF_CAPTURE_DISABLED: std::sync::atomic::AtomicBool =
 #[inline]
 pub fn set_linux_kms_dmabuf_capture_disabled_for_process(disabled: bool) {
     LINUX_KMS_DMABUF_CAPTURE_DISABLED.store(disabled, std::sync::atomic::Ordering::SeqCst);
+    if !disabled {
+        LINUX_KMS_DMABUF_ENCODE_FAILS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(x11)]
@@ -447,25 +531,35 @@ pub fn linux_kms_dmabuf_vaapi_available() -> bool {
 }
 
 // Per-display dmabuf decision. dmabuf frames are only consumable by the VAAPI
-// dmabuf encoder, so the path is enabled only when that encoder is available and
-// either the user opted in via env or the display's scanout buffer is
-// tiled/non-linear (which the CPU readback path can't decode). The process-global
-// disable flag (set after repeated encode failures) overrides everything. Both
-// the capturer and the encoder selection read this, so they stay consistent.
+// dmabuf encoder, so the path needs that encoder. When it is present it encodes
+// both linear and tiled scanout buffers zero-copy, while the CPU readback path
+// can only read buffers whose linear modifier was positively identified. The
+// unprivileged probe frequently can't read the modifier (no DRM master), so an
+// unknown modifier must not be treated as a safe CPU fallback. When the VAAPI
+// dmabuf encoder is available, prefer dmabuf regardless of the opt-in env var.
+// After repeated encode failures the process-global disable flag routes only
+// confirmed-linear displays back to CPU capture. Non-linear or unknown displays
+// keep retrying dmabuf and can clear the flag on success.
+// Both the capturer and the encoder selection read this, so they stay consistent.
 #[cfg(x11)]
 #[inline]
-pub fn is_linux_kms_dmabuf_capture_enabled_for(is_linear: bool) -> bool {
-    if is_linux_kms_dmabuf_capture_disabled_for_process() {
+pub fn is_linux_kms_dmabuf_capture_enabled_for(cpu_fallback_safe: bool) -> bool {
+    if !should_use_linux_kms_dmabuf(
+        cpu_fallback_safe,
+        is_linux_kms_dmabuf_capture_disabled_for_process(),
+        linux_kms_dmabuf_vaapi_available(),
+    ) {
         return false;
     }
-    let requested = is_linux_kms_dmabuf_capture_requested();
-    if is_linear && !requested {
-        return false;
-    }
-    if !linux_kms_dmabuf_vaapi_available() {
-        return false;
-    }
+    // VAAPI dmabuf encode is available: it is strictly the better KMS path here
+    // (handles tiled and linear scanout), so don't let a missing env var force
+    // the CPU readback path.
     true
+}
+
+#[cfg(x11)]
+fn should_use_linux_kms_dmabuf(cpu_fallback_safe: bool, disabled: bool, available: bool) -> bool {
+    available && (!disabled || !cpu_fallback_safe)
 }
 
 #[cfg(x11)]
@@ -484,13 +578,30 @@ const MAX_LINUX_KMS_DMABUF_ENCODE_FAILS: u32 = 10;
 pub fn note_linux_kms_dmabuf_encode_result(success: bool) {
     use std::sync::atomic::Ordering::SeqCst;
     if success {
-        LINUX_KMS_DMABUF_ENCODE_FAILS.store(0, SeqCst);
+        set_linux_kms_dmabuf_capture_disabled_for_process(false);
         return;
     }
     let fails = LINUX_KMS_DMABUF_ENCODE_FAILS.fetch_add(1, SeqCst) + 1;
-    if fails >= MAX_LINUX_KMS_DMABUF_ENCODE_FAILS {
+    if fails == MAX_LINUX_KMS_DMABUF_ENCODE_FAILS {
         log::error!("disabling KMS dmabuf capture after {fails} consecutive encode failures");
         set_linux_kms_dmabuf_capture_disabled_for_process(true);
+    }
+}
+
+#[cfg(all(test, x11))]
+mod kms_dmabuf_tests {
+    use super::should_use_linux_kms_dmabuf;
+
+    #[test]
+    fn disabled_dmabuf_falls_back_only_when_cpu_readback_is_known_safe() {
+        assert!(!should_use_linux_kms_dmabuf(true, true, true));
+        assert!(should_use_linux_kms_dmabuf(false, true, true));
+    }
+
+    #[test]
+    fn unavailable_vaapi_never_enables_dmabuf() {
+        assert!(!should_use_linux_kms_dmabuf(true, false, false));
+        assert!(!should_use_linux_kms_dmabuf(false, false, false));
     }
 }
 
