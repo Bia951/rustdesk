@@ -44,7 +44,7 @@ env:
   # 2. Update the `VCPKG_COMMIT_ID` in `ci.yml` and `playground.yml`.
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836" # 2025.01.13, got "/opt/artifacts/vcpkg/vcpkg: No such file or directory" with latest version
-  VERSION: "1.4.8"
+  VERSION: "1.4.9"
   NDK_VERSION: "r28c"
   #signing keys env variable checks
   ANDROID_SIGNING_KEY: "${{ secrets.ANDROID_SIGNING_KEY }}"
@@ -53,6 +53,34 @@ env:
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
 
 jobs:
+  generate-sbom:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM
+        run: |
+          syft dir:. \
+            -o cyclonedx-json=rustdesk.sbom.json
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        if: env.UPLOAD_ARTIFACT == 'true'
+        with:
+          prerelease: true
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            rustdesk.sbom.json
+
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
 
@@ -1984,6 +2012,7 @@ jobs:
           sudo apt-get install -y libarchive-tools libfuse2
           # set-up appimage-builder
           # https://github.com/AppImage/AppImageKit/issues/1395
+          sudo pip3 install "setuptools_scm<10"
           sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git
           # run appimage-builder
           pushd appimage

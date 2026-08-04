@@ -37,6 +37,17 @@ const CLIPBOARD_GET_MAX_RETRY: usize = 3;
 const CLIPBOARD_GET_RETRY_INTERVAL_DUR: Duration = Duration::from_millis(33);
 
 #[cfg(not(target_os = "android"))]
+fn valid_rgba_dimensions(width: i32, height: i32, data_len: usize) -> Option<(usize, usize)> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let expected_len = width.checked_mul(height)?.checked_mul(4)?;
+    (data_len == expected_len).then_some((width, height))
+}
+
+#[cfg(not(target_os = "android"))]
 const SUPPORTED_FORMATS: &[ClipboardFormat] = &[
     ClipboardFormat::Text,
     ClipboardFormat::Html,
@@ -151,39 +162,48 @@ pub fn update_clipboard_files(files: Vec<String>, side: ClipboardSide) {
 #[cfg(feature = "unix-file-copy-paste")]
 pub fn try_empty_clipboard_files(_side: ClipboardSide, _conn_id: i32) {
     std::thread::spawn(move || {
-        let mut ctx = CLIPBOARD_CTX.lock().unwrap();
-        if ctx.is_none() {
-            match ClipboardContext::new() {
-                Ok(x) => {
-                    *ctx = Some(x);
-                }
-                Err(e) => {
-                    log::error!("Failed to create clipboard context: {}", e);
-                    return;
-                }
-            }
-        }
-        #[allow(unused_mut)]
-        if let Some(mut ctx) = ctx.as_mut() {
-            #[cfg(target_os = "linux")]
-            {
-                use clipboard::platform::unix;
-                if unix::fuse::empty_local_files(_side == ClipboardSide::Client, _conn_id) {
-                    ctx.try_empty_clipboard_files(_side);
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                ctx.try_empty_clipboard_files(_side);
-                // No need to make sure the context is enabled.
-                clipboard::ContextSend::proc(|context| -> ResultType<()> {
-                    context.empty_clipboard(_conn_id).ok();
-                    Ok(())
-                })
-                .ok();
-            }
+        if let Err(e) = try_empty_clipboard_files_sync(_side, _conn_id) {
+            log::error!("Failed to empty clipboard files: {}", e);
         }
     });
+}
+
+#[cfg(feature = "unix-file-copy-paste")]
+pub fn try_empty_clipboard_files_sync(_side: ClipboardSide, _conn_id: i32) -> ResultType<()> {
+    let mut ctx = CLIPBOARD_CTX.lock().unwrap();
+    if ctx.is_none() {
+        match ClipboardContext::new() {
+            Ok(x) => {
+                *ctx = Some(x);
+            }
+            Err(e) => {
+                log::error!("Failed to create clipboard context: {}", e);
+                bail!("Failed to create clipboard context: {}", e);
+            }
+        }
+    }
+    #[allow(unused_mut)]
+    if let Some(mut ctx) = ctx.as_mut() {
+        #[cfg(target_os = "linux")]
+        {
+            use clipboard::platform::unix;
+            if unix::fuse::empty_local_files(_side == ClipboardSide::Client, _conn_id) {
+                ctx.try_empty_clipboard_files(_side);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ctx.try_empty_clipboard_files(_side);
+            // No need to make sure the context is enabled.
+            clipboard::ContextSend::proc(|context| -> ResultType<()> {
+                if !context.empty_clipboard(_conn_id)? {
+                    bail!("Failed to empty clipboard files for conn_id {}", _conn_id);
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -713,11 +733,15 @@ mod proto {
             Ok(ClipboardFormat::Text) => String::from_utf8(data).ok().map(ClipboardData::Text),
             Ok(ClipboardFormat::Rtf) => String::from_utf8(data).ok().map(ClipboardData::Rtf),
             Ok(ClipboardFormat::Html) => String::from_utf8(data).ok().map(ClipboardData::Html),
-            Ok(ClipboardFormat::ImageRgba) => Some(ClipboardData::Image(arboard::ImageData::rgba(
-                clipboard.width as _,
-                clipboard.height as _,
-                data.into(),
-            ))),
+            Ok(ClipboardFormat::ImageRgba) => {
+                let (width, height) =
+                    super::valid_rgba_dimensions(clipboard.width, clipboard.height, data.len())?;
+                Some(ClipboardData::Image(arboard::ImageData::rgba(
+                    width,
+                    height,
+                    data.into(),
+                )))
+            }
             Ok(ClipboardFormat::ImagePng) => {
                 Some(ClipboardData::Image(arboard::ImageData::png(data.into())))
             }
@@ -758,6 +782,22 @@ mod proto {
                 msg.set_clipboard(c.clone());
                 msg
             })
+    }
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod rgba_tests {
+    use super::valid_rgba_dimensions;
+
+    #[test]
+    fn validates_dimensions_against_content_length() {
+        assert_eq!(valid_rgba_dimensions(1, 1, 4), Some((1, 1)));
+        assert_eq!(valid_rgba_dimensions(1, 1, 3), None);
+        assert_eq!(valid_rgba_dimensions(-1, 1, 4), None);
+        assert_eq!(valid_rgba_dimensions(0, 1, 0), None);
+        assert_eq!(valid_rgba_dimensions(i32::MAX, i32::MAX, 4), None);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(valid_rgba_dimensions(i32::MAX, 2, 0), None);
     }
 }
 
@@ -868,6 +908,7 @@ pub mod clipboard_listener {
             .unwrap()
             .insert(name.clone(), tx);
 
+        cleanup_stale_listener(&mut listener_lock);
         if listener_lock.handle.is_none() {
             log::info!("Start clipboard listener thread");
             let handler = Handler {
@@ -891,6 +932,24 @@ pub mod clipboard_listener {
 
         log::info!("Clipboard listener subscribed: {}", name);
         Ok(())
+    }
+
+    fn cleanup_stale_listener(listener: &mut ClipboardListener) {
+        if !listener
+            .handle
+            .as_ref()
+            .map(|(_, h)| h.is_finished())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let Some((shutdown, h)) = listener.handle.take() {
+            log::warn!("Cleaning up stale clipboard listener handle");
+            if let Err(e) = h.join() {
+                log::error!("Clipboard listener thread panicked during stale cleanup: {:?}", e);
+            }
+            drop(shutdown);
+        }
     }
 
     pub fn unsubscribe(name: &str) {
